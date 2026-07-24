@@ -1,68 +1,72 @@
+"""Compatibility adapter for the explicit recompiler target profile.
+
+New code should pass :class:`tools.target_profile.TargetProfile` directly.
+This module keeps the historical helper names available without retaining any
+Burnout 3 or Xbox Dashboard fallback addresses.
 """
-Recompiler configuration - section mappings and constants.
 
-NOTE: These mappings must match the target XBE. Currently configured for
-Xbox Dashboard build 3944 (xboxdash.xbe).
-"""
+from __future__ import annotations
 
-# Section virtual address → file offset mappings
-# (name, va_start, va_size, raw_addr, raw_size)
-SECTIONS = [
-    # (name, va_start, va_size, raw_addr)
-    (".text",      0x00012000, 636684,  0x00002000),
-    ("D3D",        0x000AD720, 72432,   0x0009E000),
-    ("D3DX",       0x000BF220, 153536,  0x000AD000),
-    ("XGRPH",      0x000E49E0, 7624,    0x000D3000),
-    ("DSOUND",     0x000E67C0, 31344,   0x000D5000),
-    ("WMADECXM",   0x000EE240, 4912,    0x000DD000),
-    ("WMADEC",     0x000EF580, 101720,  0x000DF000),
-    ("DVDTHUNK",   0x001082E0, 1116,    0x000F8000),
-    ("XPP",        0x00108740, 31436,   0x000F9000),
-    (".data",      0x00110220, 140392,  0x00101000),
-    ("DOLBY",      0x001326A0, 28056,   0x00113000),
-    (".data1",     0x00139440, 7536,    0x0011A000),
-    ("XIPS",       0x0013B1C0, 20760,   0x0011C000),
-    ("EnglishXlate",  0x001402E0, 32428, 0x00122000),
-    ("JapaneseXlate", 0x001481A0, 27052, 0x0012A000),
-    ("GermanXlate",   0x0014EB60, 34148, 0x00131000),
-    ("FrenchXlate",   0x001570E0, 34772, 0x0013A000),
-    ("SpanishXlate",  0x0015F8C0, 34798, 0x00143000),
-    ("ItalianXlate",  0x001680C0, 34164, 0x0014C000),
-]
+from tools.target_profile import TargetProfile
 
-TEXT_VA_START = 0x00012000
-TEXT_VA_END = 0x000AD720   # end of .text = start of D3D section
-RDATA_VA_START = 0x00110220  # .data section (dashboard has no .rdata)
-RDATA_VA_END = 0x00170000
-DATA_VA_START = 0x00110220
-DATA_VA_END = 0x00170000
-KERNEL_THUNK_ADDR = 0x00012000
-ENTRY_POINT = 0x00052A81
+ACTIVE_PROFILE: TargetProfile | None = None
+SECTIONS: list[tuple[str, int, int, int]] = []
+TEXT_VA_START = 0
+TEXT_VA_END = 0
+RDATA_VA_START = 0
+RDATA_VA_END = 0
+DATA_VA_START = 0
+DATA_VA_END = 0
+KERNEL_THUNK_ADDR = 0
+ENTRY_POINT = 0
 
 
-def va_to_file_offset(va):
-    """Convert virtual address to XBE file offset."""
-    for _, sec_va, sec_size, sec_raw in SECTIONS:
-        if sec_va <= va < sec_va + sec_size:
-            return va - sec_va + sec_raw
-    return None
+def configure_target(profile: TargetProfile) -> None:
+    """Populate legacy compatibility fields from an explicit profile."""
+    global ACTIVE_PROFILE, SECTIONS
+    global TEXT_VA_START, TEXT_VA_END
+    global RDATA_VA_START, RDATA_VA_END
+    global DATA_VA_START, DATA_VA_END
+    global KERNEL_THUNK_ADDR, ENTRY_POINT
+
+    ACTIVE_PROFILE = profile
+    SECTIONS = [
+        (section.name, section.virtual_address, section.virtual_size, section.raw_address)
+        for section in profile.sections
+    ]
+    primary = profile.primary_code_section
+    TEXT_VA_START = primary.virtual_address
+    TEXT_VA_END = primary.virtual_end
+    read_only = profile.primary_read_only_section
+    writable = next((section for section in profile.data_sections if section.writable), None)
+    RDATA_VA_START = read_only.virtual_address if read_only else 0
+    RDATA_VA_END = read_only.virtual_end if read_only else 0
+    DATA_VA_START = writable.virtual_address if writable else RDATA_VA_START
+    DATA_VA_END = writable.virtual_end if writable else RDATA_VA_END
+    KERNEL_THUNK_ADDR = profile.kernel_thunk_address
+    ENTRY_POINT = profile.entry_point
 
 
-def is_code_address(va):
-    """Check if VA is in an executable section (.text or XDK library sections)."""
-    if TEXT_VA_START <= va < TEXT_VA_END:
-        return True
-    # XDK library sections also contain executable code.
-    # XIPS contains the XAP parser and IS code despite XBE marking it non-executable.
-    for name, sec_va, sec_size, _ in SECTIONS:
-        if name in (".data", ".data1", "EnglishXlate", "JapaneseXlate",
-                     "GermanXlate", "FrenchXlate", "SpanishXlate", "ItalianXlate"):
-            continue  # skip data/resource sections (but NOT XIPS — it's code)
-        if sec_va <= va < sec_va + sec_size:
-            return True
-    return False
+def require_target() -> TargetProfile:
+    """Return the active profile or reject target-ambiguous use."""
+    if ACTIVE_PROFILE is None:
+        raise RuntimeError(
+            "recompiler target is not configured; pass --analysis-json and/or "
+            "--target-profile"
+        )
+    return ACTIVE_PROFILE
 
 
-def is_data_address(va):
-    """Check if VA is in a data section."""
-    return DATA_VA_START <= va <= DATA_VA_END
+def va_to_file_offset(va: int) -> int | None:
+    """Convert a virtual address using the active target profile."""
+    return require_target().virtual_to_file_offset(va)
+
+
+def is_code_address(va: int) -> bool:
+    """Return whether a virtual address belongs to approved target code."""
+    return require_target().is_code_address(va)
+
+
+def is_data_address(va: int) -> bool:
+    """Return whether a virtual address belongs to approved target data."""
+    return require_target().is_data_address(va)

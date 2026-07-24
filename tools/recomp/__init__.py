@@ -1,2 +1,1 @@
-# Burnout 3: Takedown - x86 → C Static Recompiler
-# Translates original Xbox x86 machine code to compilable C source.
+"""Target-profile-driven Xbox x86-to-C static recompiler."""

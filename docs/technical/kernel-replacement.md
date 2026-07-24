@@ -1,18 +1,17 @@
 # Xbox Kernel Replacement
 
-Mapping 147 Xbox kernel imports to Windows equivalents for recompiled game code.
+Resolving each target XBE's ordinal thunk slots to host-side kernel replacements.
 
 ## How Xbox Kernel Imports Work
 
 The Xbox kernel exposes functions through ordinal-based imports. Unlike Windows DLLs which export by name, the Xbox kernel export table uses only ordinal numbers. The game's XBE file contains a kernel thunk table -- an array of entries where each entry stores `0x80000000 | ordinal`:
 
 ```
-Thunk table at VA 0x0036B7C0:
-  [0] = 0x80000001  → ordinal 1  (AvGetSavedDataAddress)
-  [1] = 0x80000002  → ordinal 2  (AvSendTVEncoderOption)
-  [2] = 0x80000003  → ordinal 3  (AvSetDisplayMode)
+Target thunk table decoded from the XBE header:
+  [0] = 0x80000001  → ordinal 1
+  [1] = 0x80000032  → ordinal 50
   ...
-  [146] = 0x80000168 → ordinal 360 (HalInitiateShutdown)
+  [N] = 0x00000000  → end of this title's table
 ```
 
 On real Xbox hardware, the kernel loader replaces each ordinal entry with the actual function pointer before the game runs. In our recompilation, we perform this replacement ourselves during initialization.
@@ -34,29 +33,19 @@ Each kernel thunk slot gets a synthetic virtual address in the 0xFE000000 range:
 During initialization, the ordinal entries in Xbox memory are replaced with these synthetic VAs:
 
 ```c
-void xbox_kernel_bridge_init(void) {
-    for (int i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
-        uint32_t thunk_va = XBOX_THUNK_TABLE_VA + i * 4;
-        uint32_t entry = BRIDGE_MEM32(thunk_va);
-
-        if (entry & 0x80000000) {
-            uint32_t ordinal = entry & 0x7FFFFFFF;
-            g_slot_ordinals[i] = ordinal;
-
-            uint32_t data_va = kernel_data_va_for_ordinal(ordinal);
-            if (data_va) {
-                // DATA export: write the VA of the data, not a function pointer
-                BRIDGE_MEM32(thunk_va) = data_va;
-            } else {
-                // FUNCTION export: write synthetic VA
-                BRIDGE_MEM32(thunk_va) = KERNEL_VA_BASE + i * 4;
-            }
-        }
+BOOL xbox_kernel_bridge_init(void) {
+    // xbox_MemoryLayoutInit() already decoded and validated the exact table.
+    for (uint32_t i = 0; i < active_target_thunk_count; i++) {
+        uint32_t thunk_va = active_target_thunk_base + i * 4;
+        uint32_t ordinal = BRIDGE_MEM32(thunk_va) & 0x7FFFFFFF;
+        uint32_t data_va = kernel_data_va_for_ordinal(ordinal);
+        BRIDGE_MEM32(thunk_va) = data_va ? data_va : KERNEL_VA_BASE + i * 4;
     }
+    return TRUE;
 }
 ```
 
-When recompiled code does `call [0x0036B7C0]`, it reads the synthetic VA (e.g., 0xFE000000) and triggers RECOMP_ICALL. The kernel lookup recognizes the 0xFE000000 range and dispatches to the appropriate bridge function.
+When recompiled code calls through a slot in the selected title's table, it reads the synthetic VA and triggers `RECOMP_ICALL`. The active synthetic range length equals the validated target thunk count.
 
 ## Data vs Function Exports
 
@@ -76,7 +65,7 @@ mov eax, [0x0036B800]    ; read thunk entry for KeTickCount
 mov ecx, [eax]           ; dereference to get the tick count value
 ```
 
-For data exports, the thunk entry must point to actual readable memory containing the expected structure. A "kernel data area" is allocated at 0x00740000 with the necessary structures:
+For data exports, the thunk entry must point to actual readable memory containing the expected structure. The kernel-data area is placed in a verified free RAM gap selected from the exact XBE layout:
 
 ```c
 // XboxHardwareInfo at kernel data area
@@ -234,7 +223,7 @@ Xbox input is nearly 1:1 with the Win32 XInput API. The main difference is the X
 | DirectSoundCreateBuffer | Returns stub buffer |
 | DirectSoundDoWork | No-op |
 
-Audio is fully stubbed in the current implementation. XAudio2 integration is planned but not yet implemented.
+The DirectSound compatibility objects accept many calls without full semantics. The MCPX APU path has XAudio2 output with waveOut fallback on Windows; POSIX output shims remain incomplete and must not be claimed from successful compilation alone.
 
 ### HAL and System (~20 ordinals)
 
@@ -249,7 +238,7 @@ Audio is fully stubbed in the current implementation. XAudio2 integration is pla
 
 ## Implementation Breakdown
 
-Of the 147 kernel imports in Burnout 3:
+A reference target may show a breakdown such as the following, but the active table and implementation coverage must be measured for the selected XBE:
 
 | Category | Count | Notes |
 |----------|-------|-------|
@@ -257,9 +246,9 @@ Of the 147 kernel imports in Burnout 3:
 | Stubbed (return success) | ~79 | Threading, audio, network, crypto |
 | Not hit during gameplay | ~20 | Debug, online, rare error paths |
 
-## The Resource Load Queue
+## Reference-title Resource Load Queue Case Study
 
-One of the most important kernel interactions is file loading. The game uses a ring buffer queue to request file loads:
+The following is a Burnout 3 project-specific case study, not shared kernel behavior. Other titles require their own evidence-backed file and resource paths:
 
 ```c
 // Queue structure: 24 entries x 80 bytes each
@@ -273,7 +262,7 @@ static void bridge_resource_load(void) {
 
     // Open and read from game data directory
     char path[MAX_PATH];
-    snprintf(path, sizeof(path), "Burnout 3 Takedown/%s", name);
+    snprintf(path, sizeof(path), "%s/%s", configured_game_directory, name);
     FILE *f = fopen(path, "rb");
 
     // Write file data directly into the resource VA buffer

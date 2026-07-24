@@ -58,139 +58,83 @@ game_files/
 ## Step 2: Parse the XBE
 
 ```bash
-py -3 -m tools.xbe_parser game_files/default.xbe --json game_files/mygame_analysis.json
+mkdir -p analysis targets
+py -3 -m tools.xbe_parser game_files/default.xbe \
+  --json analysis/target_analysis.json
 ```
 
-The `--json` file is **required by Step 3** — the disassembler reads the section
-layout from it. Name it `<anything>_analysis.json` and keep it next to the XBE;
-Step 3 finds it automatically.
+Keep the JSON with the exact XBE. It records the decoded entry point, section
+coordinates and flags, kernel imports, TLS, certificates, and library metadata.
+Do not copy example addresses from another title.
 
-This outputs:
-- **Entry point** — where execution starts (e.g., `0x001D2807`)
-- **Section layout** — VA, size, and raw offset for .text, .rdata, .data, and XDK lib sections
-- **Kernel imports** — which of the 147 kernel functions the game uses
-- **XDK version** — helps identify which XDK libraries were linked
-
-**Write these values down.** You'll need them to configure `xbox_memory_layout.h`.
-
-## Step 3: Disassemble
+## Step 3: Generate and Validate the Target Profile
 
 ```bash
-py -3 -m tools.disasm game_files/default.xbe --text-only -v
+py -3 -m tools.target_profile generate \
+  --analysis-json analysis/target_analysis.json \
+  --xbe game_files/default.xbe \
+  --output targets/my-game.json
+
+py -3 -m tools.target_profile validate \
+  --profile targets/my-game.json \
+  --analysis-json analysis/target_analysis.json \
+  --xbe game_files/default.xbe
 ```
 
-This typically takes 30-60 seconds for a 2-3 MB .text section. Output goes to `tools/disasm/output/`:
+The profile contains immutable parser-derived values plus optional evidence-backed
+annotations. It replaces the old practice of editing global Burnout 3 or Dashboard
+address constants. Read [Target Profiles](technical/target-profiles.md) before
+approving nonstandard code sections or special helper addresses.
 
-- `functions.json` — every detected function with address, size, instruction count
-- `xrefs.json` — call graph (who calls whom)
-
-Check the stats: you should find thousands of functions. A typical Xbox game has 10,000-25,000 functions including CRT and middleware.
-
-## Step 4: Identify Library Functions
+## Step 4: Disassemble
 
 ```bash
-py -3 -m tools.func_id game_files/default.xbe -v
+py -3 -m tools.disasm game_files/default.xbe \
+  --analysis-json analysis/target_analysis.json \
+  --target-profile targets/my-game.json \
+  --output analysis/disasm -v
 ```
 
-This classifies functions into categories:
-- **CRT** — C runtime (malloc, free, memcpy, etc.) — usually safe to leave as-is
-- **RW** — RenderWare engine (if applicable) — may need manual overrides
-- **XDK** — Xbox SDK library code (D3D8, DirectSound, etc.) — often needs stubs
-- **GAME** — Game-specific code — your main focus
-- **STUB** — Empty/trivial functions — safe to ignore
+The output directory is explicit and target-specific. Review candidates, overlaps,
+out-of-profile ranges, and uncovered executable gaps rather than treating a large
+function count as proof of correctness.
 
-## Step 5: Recompile
+## Step 5: Identify Library Functions
 
 ```bash
-py -3 -m tools.recomp game_files/default.xbe --all --split 1000
+py -3 -m tools.func_id game_files/default.xbe \
+  --analysis-json analysis/target_analysis.json \
+  --target-profile targets/my-game.json \
+  --functions analysis/disasm/functions.json \
+  --strings analysis/disasm/strings.json \
+  --xrefs analysis/disasm/xrefs.json \
+  --output analysis/func-id -v
 ```
 
-This is the big one — it can take 5-15 minutes for a large game. Output:
+Every function range is checked against the selected profile. RenderWare
+identification runs only when explicitly enabled for a supported title.
 
-```
-src/game/recomp/gen/
-├── recomp_0000.c          # Functions 0-999
-├── recomp_0001.c          # Functions 1000-1999
-├── ...                    # More splits
-├── recomp_dispatch.c      # ICALL dispatch table (binary search)
-├── recomp_funcs.h         # Forward declarations
-└── recomp_stubs.c         # Stubs for unresolvable targets
-```
+## Step 6: Recompile and Set Up the Build
 
-## Step 6: Set Up Your Build
-
-Create `CMakeLists.txt` in your game project:
-
-```cmake
-cmake_minimum_required(VERSION 3.20)
-project(my_xbox_game C)
-
-set(CMAKE_C_STANDARD 11)
-
-# Common defines
-add_compile_definitions(WIN32_LEAN_AND_MEAN NOMINMAX)
-
-# xboxrecomp runtime libraries
-add_subdirectory(path/to/xboxrecomp)
-
-# Your game executable
-add_executable(my_game
-    src/main.c                          # Entry point, window, game loop
-    src/game/recomp/recomp_manual.c     # Manual function overrides
-    src/game/recomp/gen/recomp_0000.c   # Generated code
-    src/game/recomp/gen/recomp_0001.c
-    # ... all gen files
-    src/game/recomp/gen/recomp_dispatch.c
-    src/game/recomp/gen/recomp_stubs.c
-)
-
-# Suppress warnings in generated code (it's mechanical, not pretty)
-target_compile_options(my_game PRIVATE /w)
-
-# Link runtime libraries
-target_link_libraries(my_game PRIVATE xboxrecomp)
+```bash
+py -3 -m tools.recomp game_files/default.xbe \
+  --analysis-json analysis/target_analysis.json \
+  --target-profile targets/my-game.json \
+  --functions analysis/disasm/functions.json \
+  --labels analysis/disasm/labels.json \
+  --identified analysis/func-id/identified_functions.json \
+  --output-dir analysis/recomp \
+  --all --split 1000 --gen-dir src/recomp/gen
 ```
 
-Create `src/main.c`:
+Start the project from `templates/new-game/`. Its CMake file validates the target
+profile, parser JSON, and exact XBE before generating `target_profile.h`. The runtime
+entry point, kernel-thunk address, and ICALL code ranges come from that generated
+header; do not hand-edit them in `main.c` or `recomp_types.h`.
 
-```c
-#include "kernel.h"
-#include "xbox_memory_layout.h"
-#include "d3d8_xbox.h"
-
-// Generated code dispatch
-extern void (*recomp_func_t)(void);
-recomp_func_t recomp_lookup(uint32_t xbox_va);
-recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
-
-int main(int argc, char *argv[]) {
-    // Load XBE into memory
-    FILE *f = fopen("game_files/default.xbe", "rb");
-    fseek(f, 0, SEEK_END);
-    size_t size = ftell(f);
-    rewind(f);
-    void *xbe = malloc(size);
-    fread(xbe, 1, size, f);
-    fclose(f);
-
-    // Initialize Xbox memory layout
-    xbox_MemoryLayoutInit(xbe, size);
-
-    // Initialize kernel
-    xbox_kernel_init();
-    xbox_path_init("game_files", "saves");
-    xbox_kernel_bridge_init();
-
-    // Initialize graphics
-    xbox_Direct3DCreate8(0);
-
-    // Jump to entry point!
-    recomp_func_t entry = recomp_lookup(0x001D2807);  // YOUR entry point
-    if (entry) entry();
-
-    return 0;
-}
-```
+The memory runtime parses all sections directly from the XBE and selects a verified
+free gap for kernel data, the simulated stack, and the runtime heap. It fails when
+no safe layout exists instead of reusing a reference-title range.
 
 ## Step 7: Build and Crash
 

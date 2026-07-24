@@ -55,15 +55,14 @@ extern "C" {
 /**
  * Initialize the Xbox memory layout.
  *
- * Reserves the virtual address range 0x00010000 through 0x0076F000
- * and maps the XBE sections to their expected addresses:
- * - .rdata: copied from XBE, read-only
- * - .data: initialized portion copied from XBE, BSS zeroed
+ * Creates the 64 MB Xbox RAM backing store, parses the exact XBE section
+ * table, and copies every valid section to its linked Xbox virtual address.
+ * Virtual tails beyond each section's raw data are zero-initialized for BSS.
+ * Code sections are retained because game-side scanners and pointer tables may
+ * inspect original code bytes even though translated execution is native.
  *
- * Note: .text is NOT mapped here - the recompiled code is native
- * Windows code and doesn't need to be at the original address.
- * The data sections DO need to be at their original addresses
- * because the recompiled code references globals by absolute address.
+ * The initializer also decodes the title's kernel-thunk address and chooses a
+ * verified free gap for kernel data, the simulated stack, and the runtime heap.
  *
  * @param xbe_data  Pointer to the loaded XBE file contents.
  * @param xbe_size  Size of the XBE file.
@@ -94,6 +93,14 @@ void *xbox_GetMemoryBase(void);
  */
 ptrdiff_t xbox_GetMemoryOffset(void);
 
+/**
+ * Set the title-specific value exposed through the emulated fs:[0x28] field.
+ *
+ * The shared runtime defaults this field to zero. A target may set an
+ * evidence-backed context VA before or after memory initialization.
+ */
+void xbox_MemoryLayoutSetFs28Context(uint32_t context_va);
+
 /* ================================================================
  * Xbox stack for recompiled code
  * ================================================================ */
@@ -102,11 +109,15 @@ ptrdiff_t xbox_GetMemoryOffset(void);
  * Kernel data export area
  * ================================================================ */
 
-/** Base VA for kernel data exports (XboxHardwareInfo, XboxKrnlVersion, etc.)
- *  These are kernel exports that are DATA, not functions. The game reads
- *  their thunk entries and dereferences them to access the data. */
-#define XBOX_KERNEL_DATA_BASE   0x00740000
-#define XBOX_KERNEL_DATA_SIZE   4096   /* 4 KB - plenty for all data exports */
+/** Runtime-selected VA for kernel data exports.
+ *
+ * The memory initializer places this area inside a verified free gap that does
+ * not overlap the XBE header or any loaded section. It is valid only after a
+ * successful xbox_MemoryLayoutInit() call.
+ */
+extern uint32_t g_xbox_kernel_data_base;
+#define XBOX_KERNEL_DATA_BASE   (g_xbox_kernel_data_base)
+#define XBOX_KERNEL_DATA_SIZE   4096
 
 /* Offsets within the kernel data area */
 #define KDATA_HARDWARE_INFO     0x000  /* XBOX_HARDWARE_INFO (8 bytes) */
@@ -118,37 +129,34 @@ ptrdiff_t xbox_GetMemoryOffset(void);
 #define KDATA_XE_IMAGE_FILENAME 0x060  /* XeImageFileName (ANSI_STRING) */
 #define KDATA_IO_COMPLETION_TYPE 0x070 /* IoCompletionObjectType (4 bytes) */
 #define KDATA_IO_DEVICE_TYPE    0x080  /* IoDeviceObjectType (4 bytes) */
+#define KDATA_EEPROM_KEY        0x090  /* XboxEEPROMKey (16 bytes) */
 #define KDATA_HD_KEY            0x100  /* XboxHDKey (16 bytes) */
 #define KDATA_SIGNATURE_KEY     0x110  /* XboxSignatureKey (16 bytes) */
 #define KDATA_LAN_KEY           0x120  /* XboxLANKey (16 bytes) */
 #define KDATA_ALT_SIGNATURE_KEYS 0x130 /* XboxAlternateSignatureKeys (256 bytes) */
 #define KDATA_XE_PUBLIC_KEY     0x300  /* XePublicKeyData (284 bytes) */
 
-/** Size of the simulated Xbox stack (8 MB).
- *  Increased from 1 MB because failed RECOMP_ICALL indirect calls
- *  can leak stdcall args onto the stack each frame. An 8 MB stack
- *  provides enough headroom for extended gameplay sessions. */
+/** Size of the simulated Xbox stack. */
 #define XBOX_STACK_SIZE     (8 * 1024 * 1024)
 
-/** Base VA of the stack area (above last XBE section). */
-#define XBOX_STACK_BASE     0x00780000
+/** Runtime-selected stack and heap ranges.
+ *
+ * These values are computed from the exact XBE section layout. They remain zero
+ * until xbox_MemoryLayoutInit() succeeds.
+ */
+extern uint32_t g_xbox_stack_base;
+extern uint32_t g_xbox_stack_top;
+extern uint32_t g_xbox_heap_base;
+extern uint32_t g_xbox_heap_size;
 
-/** Initial ESP value (top of stack, 16-byte aligned). */
-#define XBOX_STACK_TOP      (XBOX_STACK_BASE + XBOX_STACK_SIZE - 16)
+#define XBOX_STACK_BASE     (g_xbox_stack_base)
+#define XBOX_STACK_TOP      (g_xbox_stack_top)
+#define XBOX_HEAP_BASE      (g_xbox_heap_base)
+#define XBOX_HEAP_SIZE      (g_xbox_heap_size)
 
 /* ================================================================
  * Xbox dynamic heap (for MmAllocateContiguousMemory, etc.)
  * ================================================================ */
-
-/** Base VA of the dynamic heap area (above stack). */
-#define XBOX_HEAP_BASE      (XBOX_STACK_BASE + XBOX_STACK_SIZE)  /* 0x00880000 */
-
-/** Size of the dynamic heap.
- *  Xbox has 64 MB total RAM. The total mapped region (data + stack + heap)
- *  must equal 64 MB so the RenderWare engine's memory probing stops at the
- *  correct boundary. On a real Xbox, probing past 64 MB causes a page fault
- *  that the engine catches via SEH to determine available memory. */
-#define XBOX_HEAP_SIZE      (XBOX_TOTAL_RAM - XBOX_HEAP_BASE)  /* ~55.5 MB */
 
 /** No static mirror/guard region. RAM mirror is handled via file mapping
  *  views that alias the same physical pages as the base 64 MB region. */

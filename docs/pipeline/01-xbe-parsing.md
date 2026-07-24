@@ -60,9 +60,13 @@ The first 4 bytes are `58 42 45 48` -- the ASCII string `XBEH`. If these bytes d
 | 0x120  | 4    | Section Headers Address | VA of the section header array |
 | 0x124  | 4    | Init Flags | Initialization flags (mount utility drive, etc.) |
 | 0x128  | 4    | Entry Point | Encoded entry point address |
-| 0x130  | 4    | Kernel Thunk Table | Encoded address of kernel import table |
-| 0x150  | 4    | Library Versions Address | VA of library version array |
-| 0x154  | 4    | Number of Library Versions | Count of statically linked libraries |
+| 0x154  | 4    | Debug Unicode Filename | VA of Unicode debug filename |
+| 0x158  | 4    | Kernel Thunk Table | Encoded address of kernel import table |
+| 0x15C  | 4    | Non-kernel Imports | VA of non-kernel import directory |
+| 0x160  | 4    | Number of Library Versions | Count of statically linked libraries |
+| 0x164  | 4    | Library Versions Address | VA of library version array |
+| 0x168  | 4    | Kernel Library Version | VA of kernel version entry |
+| 0x16C  | 4    | XAPI Library Version | VA of XAPI version entry |
 
 ### Base Address
 
@@ -88,12 +92,33 @@ For Burnout 3, the encoded value decodes to `0x001D2807`, which is the address o
 
 ### Kernel Thunk Table Decoding
 
-Similarly, the kernel thunk table address at offset 0x130 is XOR-encoded:
+Similarly, the kernel thunk table address at offset 0x158 is XOR-encoded:
 
-- **Retail**: XOR with `0x5B6D40C6`
+- **Retail**: XOR with `0x5B6D40B6`
 - **Debug**: XOR with `0xEFB1F152`
 
-The decoded address points to an array of 32-bit ordinal values in the XBE's .rdata section. Each non-zero entry is `0x80000000 | ordinal`, where the ordinal indexes into the Xbox kernel's export table (366 possible exports, though most games use far fewer).
+The decoded address points to a zero-terminated array of 32-bit values in a loaded section. Each nonzero entry is `0x80000000 | ordinal`; retail kernel tables use ordinal values through 378, with some ordinal gaps.
+
+## Generate the Per-title Profile
+
+The parser JSON is the immutable input to the generalized toolchain. Bind it to
+the exact XBE before disassembly:
+
+```bash
+python -m tools.target_profile generate \
+  --analysis-json analysis/target_analysis.json \
+  --xbe game_files/default.xbe \
+  --output targets/my-game.json
+
+python -m tools.target_profile validate \
+  --profile targets/my-game.json \
+  --analysis-json analysis/target_analysis.json \
+  --xbe game_files/default.xbe
+```
+
+The profile may add evidence-backed roles or special-function annotations, but it
+cannot override the parser-derived entry point, thunk address, section coordinates,
+raw ranges, or flags. See [Target Profiles](../technical/target-profiles.md).
 
 ## Section Table
 
@@ -136,7 +161,7 @@ The gap between .data's initialized size (0x000680FC) and its virtual size (0x00
 
 ## Kernel Import Table
 
-The kernel import table is an array of 32-bit values at the decoded thunk table address. The Xbox has 366 possible kernel exports, but most games import a subset. Burnout 3 imports 147 kernel functions.
+The kernel import table is an array of 32-bit values at the decoded thunk address. A title imports only the slots present in its zero-terminated table. Reference-title counts are examples, not a runtime bound.
 
 Each entry in the table is either:
 - `0x00000000` -- unused slot (ordinal not imported)

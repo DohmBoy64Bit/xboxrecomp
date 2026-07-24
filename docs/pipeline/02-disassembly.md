@@ -135,7 +135,7 @@ push edi
 **SEH (Structured Exception Handling):**
 ```asm
 push <handler_offset>
-call __SEH_prolog    ; 0x00244784 in Burnout 3
+call __SEH_prolog    ; address must be identified for the selected target
 ```
 
 **Naked/leaf functions:**
@@ -286,21 +286,31 @@ All ASCII and Unicode strings found in .rdata, with their cross-references:
 ## Invocation
 
 ```bash
-py -3 -m tools.disasm "path/to/default.xbe" --text-only
+py -3 -m tools.disasm "path/to/default.xbe" \
+  --analysis-json analysis/target_analysis.json \
+  --target-profile targets/my-game.json \
+  --output analysis/disasm
 ```
 
-The `--text-only` flag restricts disassembly to the .text section (game code). Without it, the tool also processes the named library sections (XMV, DSOUND, etc.), which adds time but increases coverage for games that call library code via indirect jumps.
+`--analysis-json` and `--output` are required. The optional profile is
+cross-checked against the exact XBE and supplies evidence-backed section roles.
+Without `--text-only`, every profile-approved code section is analyzed. Use
+`--extra-sections` only as a documented investigation input and move confirmed
+roles into the profile. Cache identity includes the XBE, parser JSON, selected
+profile, seeds, and analyzed section set.
 
 Additional options:
-- `--output-dir <dir>`: where to write JSON files (default: `output/`)
+- `--text-only`: analyze only `.text`
+- `--extra-sections <names>`: comma-separated evidence-backed code candidates
+- `--seed-functions <file>`: additional entry points with provenance
+- `--force`: ignore a valid analysis cache and rerun
 - `--verbose`: print progress and statistics
-- `--dump-asm`: also write a human-readable assembly listing (.asm file)
 
 ## Verification
 
 After disassembly, sanity-check the results:
 
-1. **Function count**: should be in the thousands for a large game. Burnout 3 has 22,095 functions in 2.73 MB of code -- roughly one function per 130 bytes on average.
+1. **Candidate accounting**: report accepted functions, rejected candidates, overlaps, seeds, and unresolved gaps. Reference-title counts are comparisons, not acceptance criteria.
 2. **Coverage**: the total bytes covered by identified functions should be close to the section size. Gaps are expected (alignment padding, embedded data), but large unexplained gaps suggest missed functions.
 3. **Entry point**: the decoded entry point from Step 1 should appear as a function in the output.
 4. **No overlaps**: no two functions should claim the same address range. If they do, the function boundary detection has a bug.

@@ -1,0 +1,282 @@
+{
+  "schema_version": 1,
+  "profile_id": "burnout3-retail",
+  "title": "Burnout 3: Takedown (retail reference profile)",
+  "base_address": "0x00010000",
+  "image_size": 7766528,
+  "entry_point": "0x001D2807",
+  "kernel_thunk_address": "0x0036B7C0",
+  "sections": [
+    {
+      "name": ".text",
+      "virtual_address": "0x00011000",
+      "virtual_size": 2863616,
+      "raw_address": "0x00001000",
+      "raw_size": 2863616,
+      "executable": true,
+      "writable": false,
+      "role": "code"
+    },
+    {
+      "name": "XMV",
+      "virtual_address": "0x002CC200",
+      "virtual_size": 163124,
+      "raw_address": "0x002BD000",
+      "raw_size": 163124,
+      "executable": true,
+      "writable": false,
+      "role": "code",
+      "category": "game_video"
+    },
+    {
+      "name": "DSOUND",
+      "virtual_address": "0x002F3F40",
+      "virtual_size": 52668,
+      "raw_address": "0x002E5000",
+      "raw_size": 52668,
+      "executable": true,
+      "writable": false,
+      "role": "code",
+      "category": "game_audio"
+    },
+    {
+      "name": "WMADEC",
+      "virtual_address": "0x00300D00",
+      "virtual_size": 105828,
+      "raw_address": "0x002F2000",
+      "raw_size": 105828,
+      "executable": true,
+      "writable": false,
+      "role": "code",
+      "category": "game_audio"
+    },
+    {
+      "name": "XONLINE",
+      "virtual_address": "0x0031AA80",
+      "virtual_size": 124764,
+      "raw_address": "0x0030C000",
+      "raw_size": 124764,
+      "executable": true,
+      "writable": false,
+      "role": "code",
+      "category": "game_network"
+    },
+    {
+      "name": "XNET",
+      "virtual_address": "0x003391E0",
+      "virtual_size": 78056,
+      "raw_address": "0x0032B000",
+      "raw_size": 78056,
+      "executable": true,
+      "writable": false,
+      "role": "code",
+      "category": "game_network"
+    },
+    {
+      "name": "D3D",
+      "virtual_address": "0x0034C2E0",
+      "virtual_size": 83828,
+      "raw_address": "0x0033F000",
+      "raw_size": 83828,
+      "executable": true,
+      "writable": false,
+      "role": "code",
+      "category": "game_render"
+    },
+    {
+      "name": "XGRPH",
+      "virtual_address": "0x00360A60",
+      "virtual_size": 8300,
+      "raw_address": "0x00350000",
+      "raw_size": 8300,
+      "executable": true,
+      "writable": false,
+      "role": "code",
+      "category": "game_render"
+    },
+    {
+      "name": "XPP",
+      "virtual_address": "0x00362AE0",
+      "virtual_size": 36052,
+      "raw_address": "0x00353000",
+      "raw_size": 36052,
+      "executable": true,
+      "writable": false,
+      "role": "code",
+      "category": "game_input"
+    },
+    {
+      "name": ".rdata",
+      "virtual_address": "0x0036B7C0",
+      "virtual_size": 289684,
+      "raw_address": "0x0035C000",
+      "raw_size": 289684,
+      "executable": false,
+      "writable": false,
+      "role": "read-only-data"
+    },
+    {
+      "name": ".data",
+      "virtual_address": "0x003B2360",
+      "virtual_size": 3904988,
+      "raw_address": "0x003A3000",
+      "raw_size": 3904988,
+      "executable": false,
+      "writable": true,
+      "role": "data"
+    },
+    {
+      "name": "DOLBY",
+      "virtual_address": "0x0076B940",
+      "virtual_size": 29056,
+      "raw_address": "0x0040C000",
+      "raw_size": 29056,
+      "executable": true,
+      "writable": false,
+      "role": "code",
+      "category": "game_audio"
+    },
+    {
+      "name": "XON_RD",
+      "virtual_address": "0x00772AC0",
+      "virtual_size": 5416,
+      "raw_address": "0x00414000",
+      "raw_size": 5416,
+      "executable": false,
+      "writable": false,
+      "role": "read-only-data"
+    },
+    {
+      "name": ".data1",
+      "virtual_address": "0x00774000",
+      "virtual_size": 224,
+      "raw_address": "0x00416000",
+      "raw_size": 224,
+      "executable": false,
+      "writable": true,
+      "role": "data"
+    }
+  ],
+  "special_functions": {
+    "seh_prolog": "0x00244784",
+    "seh_epilog": "0x002447BF"
+  },
+  "features": {
+    "renderware_identification": true
+  },
+  "classification": {
+    "game_subcategories": {
+      "vehicle": [
+        "vehicle",
+        "car ",
+        "wheel",
+        "engine",
+        "gear",
+        "throttle",
+        "brake",
+        "steer",
+        "turbo",
+        "boost",
+        "rpm",
+        "speed",
+        "crash",
+        "takedown",
+        "jolt",
+        "wreck",
+        "drift"
+      ],
+      "audio": [
+        "sound",
+        "audio",
+        "music",
+        "sfx",
+        "voice",
+        "wma",
+        "dsp",
+        "volume",
+        "pitch",
+        "reverb",
+        "impulse",
+        "speaker",
+        "channel"
+      ],
+      "camera": [
+        "camera",
+        "cam_",
+        "look back",
+        "bumper",
+        "follow"
+      ],
+      "physics": [
+        "collid",
+        "collisi",
+        "physics",
+        "rigid",
+        "force",
+        "velocity",
+        "mass",
+        "angular",
+        "gravity",
+        "friction",
+        "momentum"
+      ],
+      "ui": [
+        "menu",
+        "hud",
+        "font",
+        "screen",
+        "button",
+        "press",
+        "select",
+        "gamertag",
+        "profile"
+      ],
+      "network": [
+        "online",
+        "xbox live",
+        "session",
+        "host",
+        "join",
+        "rank",
+        "sign in",
+        "sign out",
+        "matchmak"
+      ],
+      "io": [
+        "save",
+        "load",
+        "partition",
+        "device\\",
+        "\\tdata",
+        "content",
+        "savemeta",
+        "saveimage"
+      ],
+      "render": [
+        "render",
+        "draw",
+        "shader",
+        "vertex",
+        "texture",
+        "material",
+        "d3d",
+        "pixel"
+      ],
+      "debug": [
+        "assert",
+        "error",
+        "warning",
+        "debug"
+      ]
+    }
+  },
+  "source": {
+    "kind": "legacy-config-migration",
+    "files": [
+      "tools/disasm/config.py",
+      "tools/func_id/config.py",
+      "tools/recomp/lifter.py"
+    ],
+    "warning": "Cross-check this profile against parser analysis from the exact Burnout 3 XBE before production use."
+  }
+}

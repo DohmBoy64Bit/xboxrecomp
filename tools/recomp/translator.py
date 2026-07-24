@@ -14,9 +14,26 @@ Produces compilable C code using recomp_types.h macros.
 import json
 import os
 
-from .config import va_to_file_offset, is_code_address, TEXT_VA_START, TEXT_VA_END
+from tools.target_profile import TargetProfile, TargetProfileError
 from .disasm import Disassembler
 from .lifter import Lifter, lift_basic_block
+
+
+def _database_address(value, field_name):
+    """Parse an address field from an analysis database."""
+    if isinstance(value, bool):
+        raise TargetProfileError(f"{field_name} must be an address, not a boolean")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value, 0)
+        except ValueError as exc:
+            raise TargetProfileError(
+                f"{field_name} is not a valid integer address: {value!r}"
+            ) from exc
+    raise TargetProfileError(f"{field_name} is missing or has an unsupported type")
+
 
 
 def _fixup_icall_esp_save(lines):
@@ -94,25 +111,35 @@ class FunctionTranslator:
     """Translates individual x86 functions to C source code."""
 
     def __init__(self, xbe_data, func_db, label_db=None, classification_db=None,
-                 abi_db=None):
+                 abi_db=None, target_profile: TargetProfile | None = None):
         """
         xbe_data: bytes - raw XBE file contents
         func_db: dict - addr → function info from functions.json
         label_db: dict - addr → name from labels.json
         classification_db: dict - addr → classification from identified_functions.json
         abi_db: dict - addr → ABI info from abi_functions.json
+        target_profile: Explicit per-title address and special-function profile.
         """
         self.xbe_data = xbe_data
         self.func_db = func_db
         self.label_db = label_db or {}
         self.classification_db = classification_db or {}
+        if target_profile is None:
+            raise ValueError("FunctionTranslator requires an explicit target profile")
         self.abi_db = abi_db or {}
+        self.target_profile = target_profile
         self.disasm = Disassembler()
-        self.lifter = Lifter(func_db=func_db, label_db=label_db, abi_db=abi_db, xbe_data=xbe_data)
+        self.lifter = Lifter(
+            func_db=func_db,
+            label_db=label_db,
+            abi_db=abi_db,
+            xbe_data=xbe_data,
+            target_profile=target_profile,
+        )
 
     def _read_func_bytes(self, start_va, end_va):
         """Read raw bytes for a function from the XBE."""
-        offset = va_to_file_offset(start_va)
+        offset = self.target_profile.virtual_to_file_offset(start_va)
         if offset is None:
             return None
         size = end_va - start_va
@@ -225,14 +252,13 @@ class FunctionTranslator:
 
         # Ensure ebp tracked if function calls __SEH_prolog or __SEH_epilog
         # (lifter emits ebp = g_seh_ebp readback after these calls).
-        SEH_FUNCS = {0x00244784, 0x002447BF}
-        if any(insn.call_target in SEH_FUNCS for insn in instructions):
+        if any(self.lifter.is_seh_helper(insn.call_target) for insn in instructions):
             used_regs.add("ebp")
 
         # Build call targets list
         call_targets = set()
         for insn in instructions:
-            if insn.call_target and is_code_address(insn.call_target):
+            if insn.call_target and self.target_profile.is_code_address(insn.call_target):
                 call_targets.add(insn.call_target)
 
         # All translated functions are void(void).
@@ -462,10 +488,15 @@ class BatchTranslator:
 
     def __init__(self, xbe_path, func_json_path, labels_json_path=None,
                  identified_json_path=None, abi_json_path=None,
-                 output_dir=None):
+                 output_dir=None, target_profile: TargetProfile | None = None):
+        """Load and cross-check every database for one exact target profile."""
+        if target_profile is None:
+            raise ValueError("BatchTranslator requires an explicit target profile")
         self.xbe_path = xbe_path
-        self.output_dir = output_dir or os.path.join(
-            os.path.dirname(__file__), "output")
+        self.target_profile = target_profile
+        if not output_dir:
+            raise ValueError("BatchTranslator requires an explicit target-specific output directory")
+        self.output_dir = output_dir
 
         # Load XBE
         with open(xbe_path, "rb") as f:
@@ -475,12 +506,30 @@ class BatchTranslator:
         with open(func_json_path, "r") as f:
             func_list = json.load(f)
 
+        if not isinstance(func_list, list):
+            raise TargetProfileError("functions.json must contain a list of function records")
         self.func_db = {}
-        for func in func_list:
-            addr = int(func["start"], 16)
+        for index, func in enumerate(func_list):
+            if not isinstance(func, dict):
+                raise TargetProfileError(f"function record {index} must be a JSON object")
+            addr = _database_address(func.get("start"), f"function[{index}].start")
+            if addr in self.func_db:
+                raise TargetProfileError(
+                    f"functions.json contains duplicate start address 0x{addr:08X}"
+                )
             func["_addr"] = addr
             if "end" in func:
-                func["end"] = int(func["end"], 16)
+                end = _database_address(func["end"], f"function[{index}].end")
+                func["end"] = end
+            elif "size" in func:
+                end = addr + _database_address(
+                    func["size"], f"function[{index}].size"
+                )
+            else:
+                raise TargetProfileError(
+                    f"function[{index}] at 0x{addr:08X} has neither end nor size"
+                )
+            self.target_profile.validate_code_range(addr, end, f"function[{index}]")
             self.func_db[addr] = func
 
         # Load labels
@@ -488,17 +537,48 @@ class BatchTranslator:
         if labels_json_path and os.path.exists(labels_json_path):
             with open(labels_json_path, "r") as f:
                 labels = json.load(f)
-            for lbl in labels:
-                addr = int(lbl["address"], 16)
-                self.label_db[addr] = lbl["name"]
+            if not isinstance(labels, list):
+                raise TargetProfileError("labels.json must contain a list of label records")
+            for index, lbl in enumerate(labels):
+                if not isinstance(lbl, dict):
+                    raise TargetProfileError(f"label record {index} must be a JSON object")
+                addr = _database_address(lbl.get("address"), f"label[{index}].address")
+                if not self.target_profile.is_code_address(addr):
+                    raise TargetProfileError(
+                        f"label[{index}] address 0x{addr:08X} is outside approved code"
+                    )
+                name = lbl.get("name")
+                if not isinstance(name, str) or not name:
+                    raise TargetProfileError(f"label[{index}].name must be a non-empty string")
+                if addr in self.label_db:
+                    raise TargetProfileError(
+                        f"labels.json contains duplicate address 0x{addr:08X}"
+                    )
+                self.label_db[addr] = name
 
         # Load classifications
         self.classification_db = {}
         if identified_json_path and os.path.exists(identified_json_path):
             with open(identified_json_path, "r") as f:
                 identified = json.load(f)
-            for entry in identified:
-                addr = int(entry["start"], 16)
+            if not isinstance(identified, list):
+                raise TargetProfileError(
+                    "identified_functions.json must contain a list of records"
+                )
+            for index, entry in enumerate(identified):
+                if not isinstance(entry, dict):
+                    raise TargetProfileError(
+                        f"identified record {index} must be a JSON object"
+                    )
+                addr = _database_address(entry.get("start"), f"identified[{index}].start")
+                if addr not in self.func_db:
+                    raise TargetProfileError(
+                        f"identified[{index}] address 0x{addr:08X} is absent from functions.json"
+                    )
+                if addr in self.classification_db:
+                    raise TargetProfileError(
+                        f"identified database contains duplicate address 0x{addr:08X}"
+                    )
                 self.classification_db[addr] = entry
 
         # Load ABI data
@@ -506,14 +586,26 @@ class BatchTranslator:
         if abi_json_path and os.path.exists(abi_json_path):
             with open(abi_json_path, "r") as f:
                 abi_list = json.load(f)
-            for entry in abi_list:
-                addr = int(entry["address"], 16)
+            if not isinstance(abi_list, list):
+                raise TargetProfileError("abi_functions.json must contain a list of records")
+            for index, entry in enumerate(abi_list):
+                if not isinstance(entry, dict):
+                    raise TargetProfileError(f"ABI record {index} must be a JSON object")
+                addr = _database_address(entry.get("address"), f"abi[{index}].address")
+                if addr not in self.func_db:
+                    raise TargetProfileError(
+                        f"abi[{index}] address 0x{addr:08X} is absent from functions.json"
+                    )
+                if addr in self.abi_db:
+                    raise TargetProfileError(
+                        f"ABI database contains duplicate address 0x{addr:08X}"
+                    )
                 self.abi_db[addr] = entry
 
         # Create translator
         self.translator = FunctionTranslator(
             self.xbe_data, self.func_db, self.label_db,
-            self.classification_db, self.abi_db)
+            self.classification_db, self.abi_db, target_profile=self.target_profile)
 
     def get_functions_by_category(self, categories=None, exclude_categories=None):
         """
@@ -564,6 +656,8 @@ class BatchTranslator:
             func_list = func_list[:max_funcs]
 
         stats = {
+            "target_profile": self.target_profile.profile_id,
+            "target_title": self.target_profile.title,
             "total": len(func_list),
             "translated": 0,
             "failed": 0,
@@ -573,7 +667,7 @@ class BatchTranslator:
 
         c_chunks = []
         c_chunks.append("/**")
-        c_chunks.append(" * Burnout 3: Takedown - Mechanically Translated Game Code")
+        c_chunks.append(f" * {self.target_profile.title} - Mechanically Translated Game Code")
         c_chunks.append(f" * Generated by tools/recomp from original Xbox x86 code.")
         c_chunks.append(f" * Functions: {len(func_list)}")
         c_chunks.append(" */")
@@ -676,6 +770,8 @@ class BatchTranslator:
         # Translate all functions first, collecting results
         translations = []
         stats = {
+            "target_profile": self.target_profile.profile_id,
+            "target_title": self.target_profile.title,
             "total": len(func_list),
             "translated": 0,
             "failed": 0,
@@ -704,7 +800,7 @@ class BatchTranslator:
         header_path = os.path.join(output_dir, header_name)
         header_lines = [
             "/**",
-            " * Burnout 3: Takedown - Recompiled Function Declarations",
+            f" * {self.target_profile.title} - Recompiled Function Declarations",
             f" * {stats['translated']} functions, auto-generated by tools/recomp",
             " */",
             "",
@@ -731,7 +827,7 @@ class BatchTranslator:
             c_path = os.path.join(output_dir, f"{prefix}_{ci:04d}.c")
             c_lines = [
                 "/**",
-                f" * Burnout 3 - Recompiled code chunk {ci}",
+                f" * {self.target_profile.title} - Recompiled code chunk {ci}",
                 f" * Functions: {len(chunk)} "
                 f"(0x{chunk[0][0]:08X} - 0x{chunk[-1][0]:08X})",
                 " */",
@@ -770,7 +866,7 @@ class BatchTranslator:
         """
         lines = [
             "/**",
-            " * Burnout 3 - Recompiled Function Dispatch Table",
+            f" * {self.target_profile.title} - Recompiled Function Dispatch Table",
             f" * Maps {len(translations)} Xbox VAs to translated function pointers.",
             " * Auto-generated by tools/recomp",
             " */",

@@ -11,18 +11,18 @@ An indirect call looks like:
 ```asm
 call [eax]          ; call through function pointer
 call [ecx+0x10]     ; vtable dispatch (method at vtable offset 0x10)
-call [0x0036B7C0]   ; call through global function pointer table
+call [thunk_slot]   ; call through the current title's kernel thunk table
 ```
 
 The target address is computed at runtime. The recompiler cannot know at compile time which function will be called. This is the fundamental challenge of static recompilation.
 
 ## Sources of Indirect Calls
 
-In Burnout 3, indirect calls come from:
+Indirect calls commonly come from:
 
 1. **C++ vtable dispatch**: `obj->vtable[method_index]()` -- the most common source. RenderWare is an object-oriented engine with deep class hierarchies.
 2. **Function pointer callbacks**: Event handlers, state machine transitions, resource loaders.
-3. **Xbox kernel thunks**: The kernel thunk table at 0x0036B7C0 contains function pointers to kernel imports. Game code calls kernel functions via `call [thunk_address]`.
+3. **Xbox kernel thunks**: The exact XBE supplies a title-specific thunk table. The runtime decodes and validates it before replacing ordinal entries with synthetic dispatch VAs.
 4. **COM interfaces**: D3D8 device methods are called through COM vtables.
 5. **Jump tables**: Switch statements compiled to indexed jumps (these are actually indirect jumps, not calls, but face the same problem).
 
@@ -39,16 +39,15 @@ Every indirect call in generated code goes through the RECOMP_ICALL macro. It im
     g_icall_trace_idx++; \
     g_icall_count++; \
     \
-    /* Garbage pointer early-out: VAs in [0x400000, 0xFE000000) */ \
-    /* are outside both code range and kernel thunk range */ \
-    if (_va >= 0x00400000 && _va < 0xFE000000) { \
+    /* The generated profile contains every approved code section. */ \
+    if (_va < 0xFE000000u && !XBOX_TARGET_IS_CODE_ADDRESS(_va)) { \
         g_esp += 4; eax = 0; break; \
     } \
     \
     /* Tier 1: Manual overrides (hand-written replacements) */ \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
     \
-    /* Tier 2: Auto-generated dispatch table (22K entries) */ \
+    /* Tier 2: Auto-generated target dispatch table */ \
     if (!_fn) _fn = recomp_lookup(_va); \
     \
     /* Tier 3: Kernel bridge (thunks at 0xFE000000+) */ \
@@ -61,7 +60,7 @@ Every indirect call in generated code goes through the RECOMP_ICALL macro. It im
 
 ### Tier 1: Manual Overrides
 
-Some functions need hand-written replacements because the generated code does not work correctly (e.g., functions that rely on GPU hardware, or functions with bugs in the recompiler output). The manual lookup checks a small table (~30 entries) first:
+Some functions need hand-written replacements because the generated code does not work correctly (e.g., functions that rely on GPU hardware, or functions with bugs in the recompiler output). The manual lookup checks the target project's evidence-backed override table first:
 
 ```c
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va) {
@@ -77,7 +76,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va) {
 
 ### Tier 2: Auto-Generated Dispatch Table
 
-The main dispatch table maps all 22,097 recompiled functions. It is sorted by Xbox VA for binary search:
+The generated dispatch table maps the functions accepted for the selected target. It is sorted by Xbox VA for binary search:
 
 ```c
 typedef struct {
@@ -89,12 +88,12 @@ static const recomp_dispatch_entry_t g_dispatch_table[] = {
     { 0x00011000, sub_00011000 },
     { 0x00011040, sub_00011040 },
     { 0x000110E0, sub_000110E0 },
-    // ... 22,094 more entries ...
+    // ... target-specific entries ...
     { 0x003697E0, sub_003697E0 },
 };
 
 recomp_func_t recomp_lookup(uint32_t xbox_va) {
-    // Binary search over 22K entries
+    // Binary search over the selected target entries
     int lo = 0, hi = DISPATCH_TABLE_SIZE - 1;
     while (lo <= hi) {
         int mid = (lo + hi) / 2;
@@ -109,11 +108,11 @@ recomp_func_t recomp_lookup(uint32_t xbox_va) {
 }
 ```
 
-Binary search over 22K entries is at most 15 comparisons. At ~120 ICALLs per second, this is negligible overhead.
+Lookup cost depends on the selected target table. Measure it under the target workload rather than inheriting reference-title counts.
 
 ### Tier 3: Kernel Bridge
 
-Xbox kernel functions are not in the dispatch table. They live at synthetic VAs in the 0xFE000000+ range (one per kernel thunk slot). The kernel bridge maps these to Win32 implementations:
+Xbox kernel functions are not in the dispatch table. They live at synthetic VAs beginning at 0xFE000000, one per validated slot in the current target thunk table. The kernel bridge maps these to Win32 implementations:
 
 ```c
 recomp_func_t recomp_lookup_kernel(uint32_t xbox_va) {
@@ -172,17 +171,17 @@ RECOMP_ICALL_SAFE(MEM32(ecx + 0x10), saved_esp);
 
 Corrupted vtable pointers are the #1 source of ICALL failures. When game objects are not fully initialized (because we stubbed their constructors), their vtable pointers contain whatever was in memory -- often addresses like 0x1C45BA68 or 0x76657240 that are clearly not valid code addresses.
 
-### Centralized Range Check
+### Centralized Target-Profile Check
 
-Valid code VAs are in [0x00011000, 0x003B0000). Kernel thunks are at 0xFE000000+. Anything in between is garbage:
+The generated target header contains a predicate spanning every profile-approved code section. Ordinary title addresses must satisfy that predicate; synthetic kernel thunks remain in the separately reserved range beginning at `0xFE000000`:
 
 ```c
-if (_va >= 0x00400000 && _va < 0xFE000000) {
-    g_esp += 4; eax = 0; break;  // garbage VA
+if (_va < 0xFE000000u && !XBOX_TARGET_IS_CODE_ADDRESS(_va)) {
+    g_esp += 4; eax = 0; break;  // not approved target code
 }
 ```
 
-This single check eliminated the most common garbage VA (0x1C45BA68) and reduced ICALL failures from 180 to 121 per 2-second window -- a 33% reduction.
+Do not replace this with a single reference-title range. Xbox titles may have multiple executable sections, nonstandard code sections, and different image extents.
 
 ### Per-Function Vtable Guards
 
@@ -191,14 +190,15 @@ Some functions iterate over linked lists or arrays of objects, calling vtable me
 ```c
 // In sub_001B4170 (recomp_0004.c) -- linked list vtable dispatch
 uint32_t vtable_va = MEM32(MEM32(esi));
-if (vtable_va >= 0x00400000 && vtable_va < 0xFE000000) {
-    goto loc_001B41E0;  // skip this object, continue to next
+uint32_t method_va = MEM32(vtable_va + 0x10);
+if (method_va < 0xFE000000u && !XBOX_TARGET_IS_CODE_ADDRESS(method_va)) {
+    goto skip_invalid_object;
 }
 PUSH32(esp, 0);
-RECOMP_ICALL(MEM32(vtable_va + 0x10));
+RECOMP_ICALL(method_va);
 ```
 
-Known functions requiring guards in Burnout 3:
+The following are historical Burnout 3 project findings, not shared addresses or universal guard sites:
 - `sub_0017D790`: vtable guard at loc_0017D88D (range check before 3 ICALLs)
 - `sub_001B4170`: vtable loop guard (linked list dispatch)
 - `sub_001B41F0`: vtable loop guard

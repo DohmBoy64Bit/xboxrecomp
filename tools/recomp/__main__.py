@@ -1,11 +1,11 @@
 """
-Burnout 3: Takedown - x86 → C Static Recompiler
+Target-profile-driven Xbox x86 → C static recompiler.
 
 Usage:
     py -3 -m tools.recomp <xbe_path> [options]
 
 Options:
-    -o, --output-dir DIR    Output directory (default: tools/recomp/output)
+    -o, --output-dir DIR    Required target-specific output directory
     -f, --function ADDR     Translate a single function (hex address)
     -c, --category CAT      Translate functions of a specific category
     --game-only             Only translate game_engine + game_vtable + unknown functions
@@ -14,35 +14,17 @@ Options:
     -v, --verbose           Verbose output
     --list-categories       List available function categories and counts
     --header                Generate C header with forward declarations
+    --split N --gen-dir DIR Generate target-specific split C output
 """
 
 import argparse
-import json
 import os
 import sys
 import time
 
 from .translator import BatchTranslator
 from .output import write_summary, print_stats, generate_header
-
-
-def find_data_files():
-    """Locate the disasm/func_id output files."""
-    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-    paths = {
-        "functions": os.path.join(base, "disasm", "output", "functions.json"),
-        "labels": os.path.join(base, "disasm", "output", "labels.json"),
-        "identified": os.path.join(base, "func_id", "output", "identified_functions.json"),
-        "abi": os.path.join(base, "abi_analysis", "output", "abi_functions.json"),
-    }
-
-    for key, path in paths.items():
-        if not os.path.exists(path):
-            print(f"WARNING: {key} not found at {path}", file=sys.stderr)
-            paths[key] = None
-
-    return paths
+from tools.target_profile import TargetProfileError, load_target_profile
 
 
 def list_categories(translator):
@@ -62,11 +44,29 @@ def list_categories(translator):
 
 
 def main():
+    """Parse CLI arguments and run target-profile-bound recompilation."""
     parser = argparse.ArgumentParser(
         description="Xbox x86 -> C Static Recompiler")
     parser.add_argument("xbe_path", help="Path to default.xbe")
-    parser.add_argument("-o", "--output-dir",
-                        help="Output directory")
+    parser.add_argument(
+        "--analysis-json",
+        help="Parser analysis JSON for the exact target XBE",
+    )
+    parser.add_argument(
+        "--target-profile",
+        help="Per-title profile with section roles and special-function addresses",
+    )
+    parser.add_argument(
+        "--functions", required=True,
+        help="Explicit functions.json path for the selected target",
+    )
+    parser.add_argument("--labels", help="Explicit labels.json path")
+    parser.add_argument("--identified", help="Explicit identified_functions.json path")
+    parser.add_argument("--abi", help="Explicit abi_functions.json path")
+    parser.add_argument(
+        "-o", "--output-dir", required=True,
+        help="Target-specific output directory for summaries and single-file output",
+    )
     parser.add_argument("-f", "--function",
                         help="Translate single function (hex address)")
     parser.add_argument("-c", "--category",
@@ -85,19 +85,43 @@ def main():
     parser.add_argument("--split", type=int, metavar="N",
                         help="Split output into files of N functions each")
     parser.add_argument("--gen-dir",
-                        help="Output dir for split generated files "
-                             "(default: src/game/recomp/gen)")
+                        help="Required output directory when --split is used")
 
     args = parser.parse_args()
 
-    # Find data files
-    data_files = find_data_files()
-    if not data_files["functions"]:
-        print("ERROR: functions.json not found. Run the disassembler first.",
-              file=sys.stderr)
-        sys.exit(1)
+    try:
+        target_profile = load_target_profile(
+            profile_path=args.target_profile,
+            analysis_json=args.analysis_json,
+            xbe_path=args.xbe_path,
+        )
+    except TargetProfileError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(2)
 
-    print(f"Loading data files...", file=sys.stderr)
+    data_files = {
+        "functions": args.functions,
+        "labels": args.labels,
+        "identified": args.identified,
+        "abi": args.abi,
+    }
+    for key, value in data_files.items():
+        if value and not os.path.isfile(value):
+            print(f"ERROR: {key} database not found: {value}", file=sys.stderr)
+            sys.exit(1)
+    if args.split and not args.gen_dir:
+        print(
+            "ERROR: --split requires an explicit --gen-dir to prevent "
+            "cross-target generated output",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    print(
+        f"Target profile: {target_profile.profile_id} ({target_profile.title})",
+        file=sys.stderr,
+    )
+    print("Loading data files...", file=sys.stderr)
     t0 = time.time()
 
     translator = BatchTranslator(
@@ -107,6 +131,7 @@ def main():
         identified_json_path=data_files.get("identified"),
         abi_json_path=data_files.get("abi"),
         output_dir=args.output_dir,
+        target_profile=target_profile,
     )
 
     t_load = time.time() - t0
@@ -135,8 +160,7 @@ def main():
 
     # Generate header mode
     if args.header:
-        output_dir = args.output_dir or os.path.join(
-            os.path.dirname(__file__), "output")
+        output_dir = args.output_dir
         os.makedirs(output_dir, exist_ok=True)
 
         if args.game_only:
@@ -149,7 +173,12 @@ def main():
             funcs = translator.get_functions_by_category()
 
         header_path = os.path.join(output_dir, "recomp_functions.h")
-        generate_header(funcs, header_path, abi_db=translator.abi_db)
+        generate_header(
+            funcs,
+            header_path,
+            abi_db=translator.abi_db,
+            target_name=target_profile.title,
+        )
         print(f"Generated header: {header_path} ({len(funcs)} declarations)")
         return
 
@@ -174,9 +203,7 @@ def main():
 
     if args.split:
         # Split output mode: multiple .c files + header + dispatch table
-        gen_dir = args.gen_dir or os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "src", "game", "recomp", "gen")
+        gen_dir = args.gen_dir
 
         if args.max_funcs:
             funcs = funcs[:args.max_funcs]
@@ -212,8 +239,7 @@ def main():
         print_stats(stats)
 
     # Write summary
-    output_dir = args.output_dir or os.path.join(
-        os.path.dirname(__file__), "output")
+    output_dir = args.output_dir
     summary_path = write_summary(stats, output_dir)
     print(f"\nSummary: {summary_path}", file=sys.stderr)
 

@@ -2,9 +2,9 @@
  * kernel_bridge.c - Bridge between translated game code and kernel functions
  *
  * Problem:
- *   Translated game code calls kernel functions via indirect calls through
- *   the kernel thunk table at VA 0x0036B7C0. In the XBE file, these entries
- *   contain unresolved ordinals (0x80000000 | ordinal). On real Xbox hardware,
+ *   Translated game code calls kernel functions through a title-specific kernel
+ *   thunk table. In the XBE image, these entries contain unresolved ordinals
+ *   (0x80000000 | ordinal). On real Xbox hardware,
  *   the kernel loader replaces these with actual function pointers before the
  *   game runs.
  *
@@ -50,7 +50,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 /* ── Synthetic VA range (for function exports) ─────────── */
 
 #define KERNEL_VA_BASE  0xFE000000u
-#define KERNEL_VA_END   (KERNEL_VA_BASE + XBOX_KERNEL_THUNK_TABLE_SIZE * 4)
+#define KERNEL_VA_END   (KERNEL_VA_BASE + XBOX_KERNEL_MAX_THUNK_SLOTS * 4u)
 
 /* ── Kernel data exports ──────────────────────────────────
  *
@@ -73,22 +73,21 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
 static uint32_t kernel_data_va_for_ordinal(ULONG ordinal)
 {
     switch (ordinal) {
-    case  17: return XBOX_KERNEL_DATA_BASE + KDATA_EVENT_OBJ_TYPE;
-    case  65: return XBOX_KERNEL_DATA_BASE + KDATA_IO_COMPLETION_TYPE;
-    case  71: return XBOX_KERNEL_DATA_BASE + KDATA_IO_DEVICE_TYPE;
+    case  16: return XBOX_KERNEL_DATA_BASE + KDATA_EVENT_OBJ_TYPE;
+    case  64: return XBOX_KERNEL_DATA_BASE + KDATA_IO_COMPLETION_TYPE;
+    case  70: return XBOX_KERNEL_DATA_BASE + KDATA_IO_DEVICE_TYPE;
     case 156: return XBOX_KERNEL_DATA_BASE + KDATA_TICK_COUNT;
     case 164: return XBOX_KERNEL_DATA_BASE + KDATA_LAUNCH_DATA_PAGE;
     case 259: return XBOX_KERNEL_DATA_BASE + KDATA_THREAD_OBJ_TYPE;
+    case 321: return XBOX_KERNEL_DATA_BASE + KDATA_EEPROM_KEY;
     case 322: return XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO;
     case 323: return XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY;
     case 324: return XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION;
     case 325: return XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY;
-    case 326: return XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY;
-    case 327: return XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS;
-    case 328: return XBOX_KERNEL_DATA_BASE + KDATA_XE_IMAGE_FILENAME;
-    case 355: return XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY;         /* alias */
-    case 356: return XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS; /* alias */
-    case 357: return XBOX_KERNEL_DATA_BASE + KDATA_XE_PUBLIC_KEY;
+    case 326: return XBOX_KERNEL_DATA_BASE + KDATA_XE_IMAGE_FILENAME;
+    case 353: return XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY;
+    case 354: return XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS;
+    case 355: return XBOX_KERNEL_DATA_BASE + KDATA_XE_PUBLIC_KEY;
     default:  return 0;  /* Not a data export */
     }
 }
@@ -108,16 +107,11 @@ static void kernel_data_init(void)
     BRIDGE_MEM8(XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO + 4) = 0xA1; /* NV2A A1 */
     BRIDGE_MEM8(XBOX_KERNEL_DATA_BASE + KDATA_HARDWARE_INFO + 5) = 0xB1; /* MCPX B1 */
 
-    /* XboxKrnlVersion (ordinal 324) - XBOX_KRNL_VERSION
-     *   +0: USHORT Major (1)
-     *   +2: USHORT Minor (0)
-     *   +4: USHORT Build (5849 = XDK version)
-     *   +6: USHORT Qfe (0)
-     */
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 0) = 1;
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 2) = 0;
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 4) = 5849;
-    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 6) = 0;
+    /* XboxKrnlVersion (ordinal 324) - selected from the target XBE. */
+    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 0) = xbox_KrnlVersion.Major;
+    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 2) = xbox_KrnlVersion.Minor;
+    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 4) = xbox_KrnlVersion.Build;
+    BRIDGE_MEM16(XBOX_KERNEL_DATA_BASE + KDATA_KRNL_VERSION + 6) = xbox_KrnlVersion.Qfe;
 
     /* KeTickCount (ordinal 156) - initialized to current tick count.
      * A background thread in main.c updates this every ~1ms. */
@@ -129,14 +123,17 @@ static void kernel_data_init(void)
     /* PsThreadObjectType (ordinal 259) - type object (stub: 0) */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_THREAD_OBJ_TYPE) = 0;
 
-    /* ExEventObjectType (ordinal 17) - type object (stub: 0) */
+    /* ExEventObjectType (ordinal 16) - type object (stub: 0) */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_EVENT_OBJ_TYPE) = 0;
 
-    /* IoCompletionObjectType (ordinal 65) - type object (stub: 0) */
+    /* IoCompletionObjectType (ordinal 64) - type object (stub: 0) */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_IO_COMPLETION_TYPE) = 0;
 
-    /* IoDeviceObjectType (ordinal 71) - type object (stub: 0) */
+    /* IoDeviceObjectType (ordinal 70) - type object (stub: 0) */
     BRIDGE_MEM32(XBOX_KERNEL_DATA_BASE + KDATA_IO_DEVICE_TYPE) = 0;
+
+    /* XboxEEPROMKey (ordinal 321) - 16 bytes of zeros (no console key) */
+    memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_EEPROM_KEY) + g_xbox_mem_offset), 0, 16);
 
     /* XboxHDKey (ordinal 323) - 16 bytes of zeros (no key) */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_HD_KEY) + g_xbox_mem_offset), 0, 16);
@@ -144,13 +141,13 @@ static void kernel_data_init(void)
     /* XboxSignatureKey (ordinal 325) - 16 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_SIGNATURE_KEY) + g_xbox_mem_offset), 0, 16);
 
-    /* XboxLANKey (ordinals 326, 355) - 16 bytes of zeros */
+    /* XboxLANKey (ordinal 353) - 16 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_LAN_KEY) + g_xbox_mem_offset), 0, 16);
 
-    /* XboxAlternateSignatureKeys (ordinals 327, 356) - 256 bytes of zeros */
+    /* XboxAlternateSignatureKeys (ordinal 354) - 256 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_ALT_SIGNATURE_KEYS) + g_xbox_mem_offset), 0, 256);
 
-    /* XePublicKeyData (ordinal 357) - 284 bytes of zeros */
+    /* XePublicKeyData (ordinal 355) - 284 bytes of zeros */
     memset((void*)((uintptr_t)(XBOX_KERNEL_DATA_BASE + KDATA_XE_PUBLIC_KEY) + g_xbox_mem_offset), 0, 284);
 
     fprintf(stderr, "  Kernel data exports: initialized at Xbox VA 0x%08X\n",
@@ -159,8 +156,12 @@ static void kernel_data_init(void)
 
 /* ── Per-slot ordinal and bridge function ────────────────── */
 
+/* Active target thunk table, set from the exact XBE before bridge init. */
+static uint32_t g_kernel_thunk_table_base = 0;
+static uint32_t g_kernel_thunk_table_count = 0;
+
 /* Ordinal for each slot (read from Xbox memory during init) */
-static ULONG g_slot_ordinals[XBOX_KERNEL_THUNK_TABLE_SIZE];
+static ULONG g_slot_ordinals[XBOX_KERNEL_MAX_THUNK_SLOTS];
 
 /* Log counter - limit output to avoid flooding */
 static int g_kernel_call_count = 0;
@@ -440,7 +441,7 @@ static void bridge_NtFreeVirtualMemory(void)
         XBOX_TO_NATIVE(base_ptr), XBOX_TO_NATIVE(size_ptr), free_type);
 }
 
-/* ── ExAllocatePool / ExAllocatePoolWithTag (ordinals 15, 16) ─
+/* ── ExAllocatePool / ExAllocatePoolWithTag (ordinals 14, 15) ─
  * Must allocate from Xbox heap so the returned pointer is an Xbox VA
  * that can be accessed via MEM32(). Native HeapAlloc returns 64-bit
  * pointers that get truncated and produce garbage Xbox VAs.
@@ -659,7 +660,7 @@ static void bridge_PsTerminateSystemThread(void)
     /* Simply return - caller will clean up */
 }
 
-/* ── HalReadSMCTrayState (ordinal 47) ─────────────────────
+/* ── HalReadSMCTrayState (ordinal 9) ─────────────────────
  * VOID HalReadSMCTrayState(PDWORD TrayState, PDWORD TrayStateChangeCount)
  *
  * Returns DVD tray state. 0x10 = no disc, 0x14 = tray closed with disc.
@@ -728,7 +729,7 @@ static void bridge_KeSetTimer(void)
     g_eax = 0;
 }
 
-/* ── ExQueryPoolBlockSize (ordinal 24) ────────────────────
+/* ── ExQueryPoolBlockSize (ordinal 23) ────────────────────
  * ULONG ExQueryPoolBlockSize(PVOID PoolBlock)
  *
  * Returns the size of a pool memory block.
@@ -1141,7 +1142,7 @@ static void bridge_NtQuerySymbolicLinkObject(void)
     g_eax = STATUS_SUCCESS;
 }
 
-/* ── IoCreateFile (ordinal 67, 10 args = 40 bytes) ────── */
+/* ── IoCreateFile (ordinal 66, 10 args = 40 bytes) ────── */
 static void bridge_IoCreateFile(void)
 {
     /* Same as NtCreateFile with an extra Options arg at the end */
@@ -1179,7 +1180,7 @@ static void bridge_NtFsControlFile(void)
     g_eax = 0xC00000BBu;
 }
 
-/* ── NtCreateDirectoryObject (ordinal 188) ──────────────── */
+/* ── NtCreateDirectoryObject (ordinal 188, 2 args = 8 bytes) ──────────────── */
 static void bridge_NtCreateDirectoryObject(void)
 {
     /* Return STATUS_SUCCESS with a fake handle */
@@ -1188,7 +1189,7 @@ static void bridge_NtCreateDirectoryObject(void)
     g_eax = 0;  /* STATUS_SUCCESS */
 }
 
-/* ── IoCreateSymbolicLink (ordinal 63) ───────────────────── */
+/* ── IoCreateSymbolicLink (ordinal 67, 2 args = 8 bytes) ───────────────────── */
 static void bridge_IoCreateSymbolicLink(void)
 {
     g_eax = 0;  /* STATUS_SUCCESS */
@@ -1301,52 +1302,48 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
 {
     switch (ordinal) {
     /* ── Display / AV ── */
-    case   1: return  0;  /* AvGetSavedDataAddress(void) */
-    case   2: return 16;  /* AvSendTVEncoderOption(4) */
-    case   3: return 24;  /* AvSetDisplayMode(6) */
-    case   4: return  4;  /* AvSetSavedDataAddress(1) */
-
-    /* ── Unknown stubs ── */
-    case   8: return  0;  /* Unknown_8(void) */
-    case  23: return  0;  /* Unknown_23(void) */
-    case  42: return  0;  /* Unknown_42(void) */
+    case     1: return  0;  /* AvGetSavedDataAddress(void) */
+    case     2: return 16;  /* AvSendTVEncoderOption(4) */
+    case     3: return 24;  /* AvSetDisplayMode(6) */
+    case     4: return  4;  /* AvSetSavedDataAddress(1) */
 
     /* ── Pool Allocator ── */
-    case  15: return  4;  /* ExAllocatePool(1) */
-    case  16: return  8;  /* ExAllocatePoolWithTag(2) */
-    /* case  17: DATA export - ExEventObjectType */
-    case  24: return  4;  /* ExQueryPoolBlockSize(1) */
+    case   14: return  4;  /* ExAllocatePool(1) */
+    case   15: return  8;  /* ExAllocatePoolWithTag(2) */
+    /* case  16: DATA export - ExEventObjectType */
+    case   23: return  4;  /* ExQueryPoolBlockSize(1) */
 
     /* ── HAL ── */
-    case  40: return  4;  /* HalClearSoftwareInterrupt(1) */
-    case  41: return  8;  /* HalDisableSystemInterrupt(2) */
-    case  44: return  8;  /* HalGetInterruptVector(2) */
-    case  46: return  8;  /* HalReadSMCTrayState(2) */
-    case  47: return 24;  /* HalReadWritePCISpace(6) */
-    case  49: return  4;  /* HalRequestSoftwareInterrupt(1) */
+    case   38: return  4;  /* HalClearSoftwareInterrupt(1) */
+    case   39: return  8;  /* HalDisableSystemInterrupt(2) */
+    case   44: return  8;  /* HalGetInterruptVector(2) */
+    case    9: return  8;  /* HalReadSMCTrayState(2) */
+    case   46: return 24;  /* HalReadWritePCISpace(6) */
+    case   48: return  4;  /* HalRequestSoftwareInterrupt(1) */
     case 358: return  0;  /* HalIsResetOrShutdownPending(void) */
 
     /* ── I/O Manager ── */
-    case  62: return 36;  /* IoBuildDeviceIoControlRequest(9) */
-    /* case  65: DATA export - IoCompletionObjectType */
-    case  67: return 40;  /* IoCreateFile(10) */
-    case  69: return  4;  /* IoDeleteDevice(1) */
-    /* case  71: DATA export - IoDeviceObjectType */
-    case  74: return 12;  /* IoInitializeIrp(3) */
-    case  81: return 20;  /* IoSetIoCompletion(5) */
-    case  83: return  8;  /* IoStartNextPacket(2) */
-    case  84: return 12;  /* IoStartNextPacketByKey(3) */
-    case  85: return 16;  /* IoStartPacket(4) */
-    case  86: return 32;  /* IoSynchronousDeviceIoControlRequest(8) */
-    case  87: return 20;  /* IoSynchronousFsdRequest(5) */
+    case   61: return 36;  /* IoBuildDeviceIoControlRequest(9) */
+    /* case  64: DATA export - IoCompletionObjectType */
+    case   66: return 40;  /* IoCreateFile(10) */
+    case  67: return  8;  /* IoCreateSymbolicLink(2) */
+    case   68: return  4;  /* IoDeleteDevice(1) */
+    /* case  70: DATA export - IoDeviceObjectType */
+    case   73: return 12;  /* IoInitializeIrp(3) */
+    case   79: return 20;  /* IoSetIoCompletion(5) */
+    case   81: return  8;  /* IoStartNextPacket(2) */
+    case   82: return 12;  /* IoStartNextPacketByKey(3) */
+    case   83: return 16;  /* IoStartPacket(4) */
+    case   84: return 32;  /* IoSynchronousDeviceIoControlRequest(8) */
+    case   85: return 20;  /* IoSynchronousFsdRequest(5) */
     case 359: return  4;  /* IoMarkIrpMustComplete(1) */
 
     /* ── Kernel Synchronization ── */
-    case  95: return  8;  /* KeAlertThread(2) */
-    case  97: return  4;  /* KeBugCheck(1) */
-    case  98: return 20;  /* KeBugCheckEx(5) */
-    case  99: return  4;  /* KeCancelTimer(1) */
-    case 100: return  4;  /* KeConnectInterrupt(1) */
+    case   93: return  8;  /* KeAlertThread(2) */
+    case   95: return  4;  /* KeBugCheck(1) */
+    case   96: return 20;  /* KeBugCheckEx(5) */
+    case   97: return  4;  /* KeCancelTimer(1) */
+    case  98: return  4;  /* KeConnectInterrupt(1) */
     case 107: return 12;  /* KeInitializeDpc(3) */
     case 109: return 28;  /* KeInitializeInterrupt(7) */
     case 113: return  8;  /* KeInitializeTimerEx(2) */
@@ -1396,6 +1393,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
 
     /* ── NT File I/O & Handle ── */
     case 187: return  4;  /* NtClose(1) */
+    case 188: return  8;  /* NtCreateDirectoryObject(2) */
     case 189: return 16;  /* NtCreateEvent(4) */
     case 190: return 36;  /* NtCreateFile(9) */
     case 193: return 16;  /* NtCreateSemaphore(4) */
@@ -1418,8 +1416,8 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 225: return  8;  /* NtSetEvent(2) */
     case 226: return 20;  /* NtSetInformationFile(5) */
     case 228: return  8;  /* NtSetSystemTime(2) */
-    case 233: return 20;  /* NtWaitForMultipleObjectsEx(5) */
-    case 234: return 12;  /* NtWaitForSingleObject(3) */
+    case 235: return 20;  /* NtWaitForMultipleObjectsEx(5) */
+    case 233: return 12;  /* NtWaitForSingleObject(3) */
     case 236: return 32;  /* NtWriteFile(8) */
     case 238: return  0;  /* NtYieldExecution(void) */
 
@@ -1434,7 +1432,7 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
 
     /* ── Threading ── */
     case 255: return 40;  /* PsCreateSystemThreadEx(10) */
-    case 256: return 12;  /* KeDelayExecutionThread(3) */
+    case  99: return 12;  /* KeDelayExecutionThread(3) */
     case 258: return  4;  /* PsTerminateSystemThread(1) */
     /* case 259: DATA export - PsThreadObjectType */
 
@@ -1452,26 +1450,37 @@ static int stdcall_args_for_ordinal(ULONG ordinal)
     case 305: return  8;  /* RtlTimeToTimeFields(2) */
     case 308: return 12;  /* RtlUnicodeStringToAnsiString(3) */
     case 312: return 16;  /* RtlUnwind(4) */
-    case 354: return 12;  /* RtlRip(3) */
+    case 352: return 12;  /* RtlRip(3) */
 
     /* ── Xbox Identity (data exports) ── */
-    /* cases 322-328, 355-357: DATA exports */
+    /* cases 321-326 and 353-355: DATA exports */
 
     /* ── Port I/O ── */
-    case 335: return 12;  /* WRITE_PORT_BUFFER_USHORT(3) */
-    case 336: return 12;  /* WRITE_PORT_BUFFER_ULONG(3) */
+    case 329: return 12;  /* READ_PORT_BUFFER_UCHAR(3) */
+    case 330: return 12;  /* READ_PORT_BUFFER_USHORT(3) */
+    case 331: return 12;  /* READ_PORT_BUFFER_ULONG(3) */
+    case 332: return 12;  /* WRITE_PORT_BUFFER_UCHAR(3) */
+    case 333: return 12;  /* WRITE_PORT_BUFFER_USHORT(3) */
+    case 334: return 12;  /* WRITE_PORT_BUFFER_ULONG(3) */
 
     /* ── Crypto ── */
-    case 337: return  4;  /* XcSHAInit(1) */
-    case 338: return 12;  /* XcSHAUpdate(3) */
-    case 339: return  8;  /* XcSHAFinal(2) */
-    case 340: return 12;  /* XcRC4Key(3) */
-    case 344: return 12;  /* XcPKDecPrivate(3) */
-    case 345: return  4;  /* XcPKGetKeyLen(1) */
-    case 346: return 12;  /* XcVerifyPKCS1Signature(3) */
-    case 347: return 20;  /* XcModExp(5) */
-    case 349: return 12;  /* XcKeyTable(3) */
-    case 353: return  8;  /* XcUpdateCrypto(2) */
+    case 335: return  4;  /* XcSHAInit(1) */
+    case 336: return 12;  /* XcSHAUpdate(3) */
+    case 337: return  8;  /* XcSHAFinal(2) */
+    case 338: return 12;  /* XcRC4Key(3) */
+    case 339: return 12;  /* XcRC4Crypt(3) */
+    case 340: return 28;  /* XcHMAC(7) */
+    case 341: return 12;  /* XcPKEncPublic(3) */
+    case 342: return 12;  /* XcPKDecPrivate(3) */
+    case 343: return  4;  /* XcPKGetKeyLen(1) */
+    case 344: return 12;  /* XcVerifyPKCS1Signature(3) */
+    case 345: return 20;  /* XcModExp(5) */
+    case 346: return  8;  /* XcDESKeyParity(2) */
+    case 347: return 12;  /* XcKeyTable(3) */
+    case 348: return 20;  /* XcBlockCrypt(5) */
+    case 349: return 28;  /* XcBlockCryptCBC(7) */
+    case 350: return  8;  /* XcCryptService(2) */
+    case 351: return  8;  /* XcUpdateCrypto(2) */
 
     default:  return  0;  /* DATA exports or truly unknown */
     }
@@ -1493,6 +1502,7 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 200: return bridge_NtFsControlFile;
     case 202: return bridge_NtOpenFile;
     case 203: return bridge_NtOpenSymbolicLinkObject;
+    case 215: return bridge_NtQuerySymbolicLinkObject;
     case 207: return bridge_NtQueryDirectoryFile;
     case 210: return bridge_NtQueryFullAttributesFile;
     case 211: return bridge_NtQueryInformationFile;
@@ -1514,9 +1524,9 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 199: return bridge_NtFreeVirtualMemory;
 
     /* Pool */
-    case  15: return bridge_ExAllocatePool;
-    case  16: return bridge_ExAllocatePoolWithTag;
-    case  24: return bridge_ExQueryPoolBlockSize;
+    case  14: return bridge_ExAllocatePool;
+    case  15: return bridge_ExAllocatePoolWithTag;
+    case  23: return bridge_ExQueryPoolBlockSize;
 
     /* IRQL */
     case 160: return bridge_KfRaiseIrql;
@@ -1546,14 +1556,14 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
     case 238: return bridge_NtYieldExecution;
 
     /* Hardware */
-    case  47: return bridge_HalReadSMCTrayState;
+    case   9: return bridge_HalReadSMCTrayState;
 
     /* Display */
     case   3: return bridge_AvSetDisplayMode;
 
     /* I/O */
-    case  63: return bridge_IoCreateSymbolicLink;
-    case  67: return bridge_IoCreateFile;
+    case  67: return bridge_IoCreateSymbolicLink;
+    case  66: return bridge_IoCreateFile;
     case 188: return bridge_NtCreateDirectoryObject;
     case 246: return bridge_ObReferenceObjectByHandle;
 
@@ -1571,8 +1581,8 @@ static bridge_func_t bridge_for_ordinal(ULONG ordinal)
 
 /* ── Per-slot bridge functions (resolved at init) ────────── */
 
-static bridge_func_t g_slot_bridges[XBOX_KERNEL_THUNK_TABLE_SIZE];
-static int g_slot_arg_bytes[XBOX_KERNEL_THUNK_TABLE_SIZE];
+static bridge_func_t g_slot_bridges[XBOX_KERNEL_MAX_THUNK_SLOTS];
+static int g_slot_arg_bytes[XBOX_KERNEL_MAX_THUNK_SLOTS];
 
 /* Current dispatching slot */
 static int g_kernel_dispatch_slot = -1;
@@ -1583,7 +1593,7 @@ static void kernel_thunk_dispatch(void)
     bridge_func_t bridge;
     ULONG ordinal;
 
-    if (slot < 0 || slot >= XBOX_KERNEL_THUNK_TABLE_SIZE) {
+    if (slot < 0 || (uint32_t)slot >= g_kernel_thunk_table_count) {
         fprintf(stderr, "  [KERNEL] bad slot %d\n", slot);
         g_eax = 0;
         g_esp += 4;  /* pop dummy return address */
@@ -1626,7 +1636,7 @@ static void kernel_thunk_dispatch(void)
          * gating on g_kernel_call_count: a missing bridge is rare and is
          * usually the reason a game misbehaves, so it must not be swallowed
          * by the general call-trace throttle. Bounded to one line per slot. */
-        static uint8_t warned[XBOX_KERNEL_THUNK_TABLE_SIZE];
+        static uint8_t warned[XBOX_KERNEL_MAX_THUNK_SLOTS];
         if (!warned[slot]) {
             warned[slot] = 1;
             fprintf(stderr, "  [KERNEL] WARNING: no bridge for ordinal %u (slot %d), returning 0\n",
@@ -1656,9 +1666,12 @@ static void kernel_thunk_dispatch(void)
  */
 recomp_func_t recomp_lookup_kernel(uint32_t xbox_va)
 {
-    if (xbox_va >= KERNEL_VA_BASE && xbox_va < KERNEL_VA_END) {
-        int slot = (xbox_va - KERNEL_VA_BASE) / 4;
-        if (slot >= 0 && slot < XBOX_KERNEL_THUNK_TABLE_SIZE) {
+    uint32_t active_end = KERNEL_VA_BASE + g_kernel_thunk_table_count * 4;
+
+    if (g_kernel_thunk_table_count > 0 &&
+        xbox_va >= KERNEL_VA_BASE && xbox_va < active_end) {
+        int slot = (int)((xbox_va - KERNEL_VA_BASE) / 4);
+        if (slot >= 0 && (uint32_t)slot < g_kernel_thunk_table_count) {
             g_kernel_dispatch_slot = slot;
             return kernel_thunk_dispatch;
         }
@@ -1677,76 +1690,109 @@ recomp_func_t recomp_lookup_kernel(uint32_t xbox_va)
  * resolves each to a per-ordinal bridge function, and replaces the entry
  * with a synthetic VA for dispatch.
  */
-void xbox_kernel_bridge_init(void)
+void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count)
 {
-    int i;
+    if (xbox_va == 0 || count == 0) {
+        g_kernel_thunk_table_base = 0;
+        g_kernel_thunk_table_count = 0;
+        return;
+    }
+
+    if (count > XBOX_KERNEL_MAX_THUNK_SLOTS) {
+        fprintf(stderr,
+                "  ERROR: kernel thunk count %u exceeds supported maximum %u\n",
+                count, XBOX_KERNEL_MAX_THUNK_SLOTS);
+        g_kernel_thunk_table_base = 0;
+        g_kernel_thunk_table_count = 0;
+        return;
+    }
+
+    g_kernel_thunk_table_base = xbox_va;
+    g_kernel_thunk_table_count = count;
+}
+
+BOOL xbox_kernel_bridge_init(void)
+{
+    uint32_t i;
     int resolved = 0;
     int bridged = 0;
     int unbridged = 0;
-    DWORD old_protect;
+    DWORD old_protect = PAGE_READWRITE;
 
-    fprintf(stderr, "  Kernel thunk bridge: resolving %d entries at 0x%08X\n",
-            XBOX_KERNEL_THUNK_TABLE_SIZE, XBOX_KERNEL_THUNK_TABLE_BASE);
-
-    /* The thunk table lives in .rdata which is marked PAGE_READONLY.
-     * Temporarily make it writable so we can patch the ordinals. */
-    VirtualProtect(
-        (LPVOID)((uintptr_t)XBOX_KERNEL_THUNK_TABLE_BASE + g_xbox_mem_offset),
-        XBOX_KERNEL_THUNK_TABLE_SIZE * 4,
-        PAGE_READWRITE,
-        &old_protect
-    );
-
-    /* Initialize kernel data export values first */
-    kernel_data_init();
-
-    for (i = 0; i < XBOX_KERNEL_THUNK_TABLE_SIZE; i++) {
-        uint32_t va = XBOX_KERNEL_THUNK_TABLE_BASE + i * 4;
-        uint32_t current = BRIDGE_MEM32(va);
-
-        if (current & 0x80000000) {
-            /* Read the actual ordinal from Xbox memory */
-            ULONG ordinal = current & 0x7FFFFFFF;
-            g_slot_ordinals[i] = ordinal;
-
-            /* Check if this is a data export */
-            uint32_t data_va = kernel_data_va_for_ordinal(ordinal);
-            if (data_va) {
-                /* DATA export: point thunk to actual data in mapped memory.
-                 * This allows the game to dereference the thunk entry. */
-                BRIDGE_MEM32(va) = data_va;
-                resolved++;
-                bridged++;
-                continue;
-            }
-
-            /* FUNCTION export: use synthetic VA for dispatch */
-            g_slot_bridges[i] = bridge_for_ordinal(ordinal);
-            g_slot_arg_bytes[i] = stdcall_args_for_ordinal(ordinal);
-            if (g_slot_bridges[i]) {
-                bridged++;
-            } else {
-                unbridged++;
-            }
-
-            /* Replace Xbox memory entry with synthetic VA */
-            uint32_t synthetic = KERNEL_VA_BASE + i * 4;
-            BRIDGE_MEM32(va) = synthetic;
-            resolved++;
-        }
+    if (g_kernel_thunk_table_base == 0 || g_kernel_thunk_table_count == 0) {
+        fprintf(stderr,
+                "  ERROR: kernel thunk bridge has no target table; "
+                "xbox_MemoryLayoutInit must decode the exact XBE first\n");
+        return FALSE;
     }
 
-    /* Restore original protection */
-    VirtualProtect(
-        (LPVOID)((uintptr_t)XBOX_KERNEL_THUNK_TABLE_BASE + g_xbox_mem_offset),
-        XBOX_KERNEL_THUNK_TABLE_SIZE * 4,
-        old_protect,
-        &old_protect
-    );
+    memset(g_slot_ordinals, 0, sizeof(g_slot_ordinals));
+    memset(g_slot_bridges, 0, sizeof(g_slot_bridges));
+    memset(g_slot_arg_bytes, 0, sizeof(g_slot_arg_bytes));
 
-    fprintf(stderr, "  Kernel thunk bridge: %d/%d resolved (%d bridged, %d stub)\n",
-            resolved, XBOX_KERNEL_THUNK_TABLE_SIZE, bridged, unbridged);
+    fprintf(stderr, "  Kernel thunk bridge: resolving %u entries at 0x%08X\n",
+            g_kernel_thunk_table_count, g_kernel_thunk_table_base);
+
+    if (!VirtualProtect(
+            (LPVOID)((uintptr_t)g_kernel_thunk_table_base + g_xbox_mem_offset),
+            g_kernel_thunk_table_count * 4,
+            PAGE_READWRITE,
+            &old_protect)) {
+        fprintf(stderr, "  ERROR: failed to make kernel thunk table writable\n");
+        return FALSE;
+    }
+
+    kernel_data_init();
+
+    for (i = 0; i < g_kernel_thunk_table_count; i++) {
+        uint32_t va = g_kernel_thunk_table_base + i * 4;
+        uint32_t current = BRIDGE_MEM32(va);
+
+        if ((current & 0x80000000u) == 0) {
+            fprintf(stderr,
+                    "  ERROR: kernel thunk slot %u at 0x%08X contains "
+                    "non-ordinal value 0x%08X\n",
+                    i, va, current);
+            VirtualProtect(
+                (LPVOID)((uintptr_t)g_kernel_thunk_table_base + g_xbox_mem_offset),
+                g_kernel_thunk_table_count * 4, old_protect, &old_protect);
+            return FALSE;
+        }
+
+        ULONG ordinal = current & 0x7FFFFFFFu;
+        g_slot_ordinals[i] = ordinal;
+
+        uint32_t data_va = kernel_data_va_for_ordinal(ordinal);
+        if (data_va) {
+            BRIDGE_MEM32(va) = data_va;
+            resolved++;
+            bridged++;
+            continue;
+        }
+
+        g_slot_bridges[i] = bridge_for_ordinal(ordinal);
+        g_slot_arg_bytes[i] = stdcall_args_for_ordinal(ordinal);
+        if (g_slot_bridges[i]) {
+            bridged++;
+        } else {
+            unbridged++;
+        }
+
+        BRIDGE_MEM32(va) = KERNEL_VA_BASE + i * 4;
+        resolved++;
+    }
+
+    if (!VirtualProtect(
+            (LPVOID)((uintptr_t)g_kernel_thunk_table_base + g_xbox_mem_offset),
+            g_kernel_thunk_table_count * 4,
+            old_protect,
+            &old_protect)) {
+        fprintf(stderr, "  WARNING: failed to restore kernel thunk protection\n");
+    }
+
+    fprintf(stderr, "  Kernel thunk bridge: %d/%u resolved (%d bridged, %d stub)\n",
+            resolved, g_kernel_thunk_table_count, bridged, unbridged);
     fprintf(stderr, "  Synthetic VA range: 0x%08X-0x%08X\n",
-            KERNEL_VA_BASE, KERNEL_VA_BASE + (resolved - 1) * 4);
-
+            KERNEL_VA_BASE, KERNEL_VA_BASE + (g_kernel_thunk_table_count - 1) * 4);
+    return TRUE;
 }

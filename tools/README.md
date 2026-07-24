@@ -12,45 +12,22 @@ Python 3.10+ required. On Windows, use `py -3` instead of `python3`.
 
 ## Pipeline Overview
 
-```
+Every stage is bound to the exact target. The parser produces immutable XBE
+metadata; `tools.target_profile` turns it into a validated per-title profile;
+and all downstream databases and output directories are passed explicitly.
+
+```text
 default.xbe
-    │
-    ▼
-┌─────────────────────────────────────┐
-│  1. xbe_parser                       │  Parse XBE headers, sections, imports
-│     py -3 -m tools.xbe_parser        │  Output: section map, kernel imports
-│     game_files/default.xbe           │
-└─────────────┬───────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────┐
-│  2. disasm                           │  Disassemble .text, find functions
-│     py -3 -m tools.disasm            │  Output: functions.json, xrefs.json
-│     game_files/default.xbe           │
-│     --text-only                      │
-└─────────────┬───────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────┐
-│  3. func_id                          │  Classify: CRT, RenderWare, XDK, game
-│     py -3 -m tools.func_id           │  Output: classified function database
-│     game_files/default.xbe -v        │
-└─────────────┬───────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────┐
-│  4. recomp                           │  Translate x86 → C source code
-│     py -3 -m tools.recomp            │  Output: gen/*.c, dispatch, headers
-│     game_files/default.xbe           │
-│     --all --split 1000               │
-└─────────────┬───────────────────────┘
-              │
-              ▼
-        gen/recomp_*.c
-        gen/recomp_dispatch.c
-        gen/recomp_funcs.h
-        gen/recomp_stubs.c
+    └─ tools.xbe_parser --json analysis/target_analysis.json
+          └─ tools.target_profile generate --xbe default.xbe
+                ├─ tools.disasm --output analysis/disasm
+                ├─ tools.func_id --functions/--strings/--xrefs ...
+                └─ tools.recomp --functions ... --gen-dir src/recomp/gen
 ```
+
+Reference profiles under `targets/` are opt-in fixtures. Missing target input is
+an error; no command silently selects Burnout 3 or Xbox Dashboard addresses.
+See [Target Profiles](../docs/technical/target-profiles.md).
 
 ## Tool Details
 
@@ -59,7 +36,8 @@ default.xbe
 Reads an Xbox executable and extracts all metadata needed by downstream tools.
 
 ```bash
-py -3 -m tools.xbe_parser game_files/default.xbe
+py -3 -m tools.xbe_parser game_files/default.xbe \
+  --json analysis/target_analysis.json
 ```
 
 **What it extracts:**
@@ -72,7 +50,7 @@ py -3 -m tools.xbe_parser game_files/default.xbe
 - TLS directory
 - Library versions (statically linked XDK libs)
 
-**Output format:** Human-readable text to stdout. Key values for your project:
+**Output:** Human-readable text plus the requested machine-readable JSON. Example values below are illustrative, not reusable configuration:
 
 ```
 Entry Point:   0x001D2807
@@ -85,23 +63,30 @@ Sections:
 Kernel Imports: 147 ordinals
 ```
 
-Use these values to configure `xbox_memory_layout.h` in your runtime.
+Generate a target profile from the JSON and exact XBE; do not copy these example values into shared headers.
 
 ---
 
 ### 2. disasm — Disassembler & Function Detector
 
-Performs static analysis on the .text section to find all functions.
+Performs static analysis across every code section approved by the selected target profile.
 
 ```bash
-py -3 -m tools.disasm game_files/default.xbe --text-only
+py -3 -m tools.disasm game_files/default.xbe \
+  --analysis-json analysis/target_analysis.json \
+  --target-profile targets/my-game.json \
+  --output analysis/disasm
 ```
 
-**Options:**
+**Required target inputs:**
 | Flag | Description |
 |------|-------------|
-| `--text-only` | Only analyze .text section (skip library sections) |
-| `--output-dir DIR` | Output directory (default: `tools/disasm/output/`) |
+| `--analysis-json FILE` | Parser JSON for the exact XBE |
+| `--target-profile FILE` | Optional annotations, cross-checked against JSON and XBE |
+| `--output DIR` | Explicit target-specific database/output directory |
+| `--text-only` | Analyze only `.text`; omit for every approved code section |
+| `--extra-sections NAMES` | Additional sections already approved as code by the selected profile |
+| `--seed-functions FILE` | Additional entry points with recorded provenance |
 | `--verbose` / `-v` | Show progress during analysis |
 
 **How it works:**
@@ -113,15 +98,14 @@ py -3 -m tools.disasm game_files/default.xbe --text-only
 **Output files:**
 | File | Contents |
 |------|----------|
-| `functions.json` | Array of `{address, size, instructions, calls, callers}` |
+| `functions.json` | Array of function ranges with `start`, `end`, size, discovery evidence, calls, and callers |
 | `xrefs.json` | Cross-reference database (call graph) |
 | `strings.json` | Discovered string references |
-| `stats.json` | Summary statistics |
+| `summary.json` | Summary statistics and analyzed-section counts |
 
-**Function detection accuracy:**
-- Typically finds 95%+ of functions on first pass
-- Remaining ~5% are callback functions only reachable via indirect calls
-- The recompiler handles unknown targets at runtime via the ICALL dispatch
+**Validation requirement:** Report candidates, overlaps, uncovered code gaps,
+and out-of-profile ranges. Function-count growth is not evidence of correctness,
+and unresolved callbacks remain explicit until supported by static or runtime evidence.
 
 ---
 
@@ -130,14 +114,18 @@ py -3 -m tools.disasm game_files/default.xbe --text-only
 Classifies functions into categories to help you understand what you're looking at.
 
 ```bash
-py -3 -m tools.func_id game_files/default.xbe -v
+py -3 -m tools.func_id game_files/default.xbe \
+  --analysis-json analysis/target_analysis.json \
+  --target-profile targets/my-game.json \
+  --functions analysis/disasm/functions.json \
+  --strings analysis/disasm/strings.json \
+  --xrefs analysis/disasm/xrefs.json \
+  --output analysis/func-id -v
 ```
 
-**Options:**
-| Flag | Description |
-|------|-------------|
-| `-v` / `--verbose` | Show identification details |
-| `--output-dir DIR` | Output directory (default: `tools/func_id/output/`) |
+All database paths and the output directory are required. Every function range is
+validated against the selected profile. RenderWare naming runs only when the profile
+explicitly enables it; it is not a universal Xbox classification pass.
 
 **Classification strategies:**
 
@@ -169,16 +157,28 @@ py -3 -m tools.func_id game_files/default.xbe -v
 The core tool. Translates every x86 instruction in every function into equivalent C code.
 
 ```bash
-py -3 -m tools.recomp game_files/default.xbe --all --split 1000
+py -3 -m tools.recomp game_files/default.xbe \
+  --analysis-json analysis/target_analysis.json \
+  --target-profile targets/my-game.json \
+  --functions analysis/disasm/functions.json \
+  --labels analysis/disasm/labels.json \
+  --identified analysis/func-id/identified_functions.json \
+  --output-dir analysis/recomp \
+  --all --split 1000 --gen-dir src/recomp/gen
 ```
 
-**Options:**
+**Important options:**
 | Flag | Description |
 |------|-------------|
-| `--all` | Recompile all detected functions |
+| `--functions FILE` | Required function database for this target |
+| `--labels FILE` | Optional labels from the same target |
+| `--identified FILE` | Optional classification database from the same target |
+| `--abi FILE` | Optional ABI database from the same target |
+| `--output-dir DIR` | Required summaries/single-file output directory |
+| `--all` | Recompile all accepted functions |
 | `--split N` | Split output into files of N functions each |
-| `--func ADDR` | Recompile a single function (hex address) |
-| `--output-dir DIR` | Output directory (default: `tools/recomp/output/`) |
+| `--gen-dir DIR` | Required durable generated-code directory when splitting |
+| `--function ADDR` | Recompile one hexadecimal function address |
 | `--verbose` | Show per-function progress |
 
 **Output files:**
@@ -237,20 +237,68 @@ XMV is the Xbox's proprietary video container format used for FMV sequences, boo
 Recovers real function names from an XBE via a headless Ghidra pass and merges
 them into the recompiler's `functions.json` so the generated C uses meaningful
 names instead of `sub_XXXXXXXX`. Optional and supplementary — the core pipeline
-needs no disassembler.
+does not require Ghidra.
 
 ```bash
-# 1. analyze the XBE (builds a flat image, imports raw, runs FidDb analysis, exports JSON)
-XBE=/path/to/default.xbe tools/ghidra_naming/run_ghidra.sh
-# 2. build the {address: name} map and (optionally) apply it to functions.json
-py -3 tools/ghidra_naming/merge_names.py            # preview
-py -3 tools/ghidra_naming/merge_names.py --apply     # write into tools/disasm/output/functions.json (.bak first)
+# 1. Analyze into an explicit target-specific Ghidra root.
+XBE=/path/to/default.xbe \
+GHIDRA_OUT=/path/to/analysis/ghidra \
+  tools/ghidra_naming/run_ghidra.sh
+
+# 2. Build a target-specific name map.
+py -3 tools/ghidra_naming/merge_names.py \
+  --export-dir /path/to/analysis/ghidra/export \
+  --out /path/to/analysis/ghidra/ghidra_names.json
+
+# 3. Optional apply: exact functions database and target identity are required.
+py -3 tools/ghidra_naming/merge_names.py \
+  --export-dir /path/to/analysis/ghidra/export \
+  --out /path/to/analysis/ghidra/ghidra_names.json \
+  --functions-json /path/to/analysis/disasm/functions.json \
+  --target-profile /path/to/targets/my-game.json \
+  --analysis-json /path/to/analysis/target_analysis.json \
+  --xbe /path/to/default.xbe \
+  --apply
 ```
 
 Set `GHIDRA_HOME` if Ghidra is not at the default path. Since retail XBEs are
 stripped, the realistic yield is the statically-linked CRT/XDK/library functions
 (FidDb signatures); proprietary engine code keeps `sub_` names unless you add
 RTTI/vtable recovery or library signatures. See `tools/ghidra_naming/README.md`.
+
+### 7. symbols/map_names.py — Exact-build MAP recovery and XDK name porting
+
+Resolve names only when a MAP, parser analysis, and exact XBE agree on target
+identity:
+
+```bash
+py -3 tools/symbols/map_names.py resolve \
+  /path/to/target.map analysis/target_analysis.json \
+  --target-xbe game_files/default.xbe \
+  --target-profile targets/my-game.json \
+  --output analysis/symbols/map_names.json
+```
+
+Port library names from another exact build with both donor and target identities
+validated. By default, matching is limited to the intersection of code sections
+that both profiles categorize as XDK/library surfaces:
+
+```bash
+py -3 tools/symbols/map_names.py port \
+  --donor-map /path/to/donor.map \
+  --donor-xbe /path/to/donor/default.xbe \
+  --donor-analysis /path/to/donor_analysis.json \
+  --donor-profile /path/to/donor-profile.json \
+  --target-xbe game_files/default.xbe \
+  --target-analysis analysis/target_analysis.json \
+  --target-profile targets/my-game.json \
+  --target-functions analysis/disasm/functions.json \
+  --output analysis/symbols/ported_names.json
+```
+
+The tool rejects mismatched MAP entry points, wrong-target function ranges,
+unapproved section overrides, and missing exact-XBE identity. Reference-title
+measurements remain historical evidence, not default configuration.
 
 ---
 

@@ -8,8 +8,10 @@ import time
 from pathlib import Path
 from typing import List, Optional
 
+from tools.target_profile import TargetProfile, load_target_profile
+
 from . import config
-from .loader import load_image, BinaryImage, SectionInfo, _find_analysis_json
+from .loader import load_image, BinaryImage, SectionInfo
 from .engine import DisasmEngine
 from .functions import FunctionDetector
 from .xrefs import build_xrefs, XRefTracker
@@ -26,12 +28,18 @@ class Disassembler:
     Top-level disassembly orchestrator.
 
     Usage:
-        d = Disassembler("path/to/default.xbe")
+        d = Disassembler(
+            "path/to/default.xbe",
+            analysis_json="analysis/target_analysis.json",
+            target_profile="targets/my-game.json",
+            output_dir="analysis/disasm",
+        )
         d.run()
     """
 
     def __init__(self, xbe_path: str,
                  analysis_json: Optional[str] = None,
+                 target_profile: Optional[str] = None,
                  output_dir: Optional[str] = None,
                  text_only: bool = False,
                  stats_only: bool = False,
@@ -39,9 +47,13 @@ class Disassembler:
                  force: bool = False,
                  extra_sections: Optional[list] = None,
                  seed_functions: Optional[list] = None):
+        """Initialize one explicit-target disassembly run and its output state."""
         self.xbe_path = xbe_path
         self.analysis_json = analysis_json
-        self.output_dir = output_dir or config.DEFAULT_OUTPUT_DIR
+        self.target_profile_path = target_profile
+        if not output_dir:
+            raise ValueError("Disassembler requires an explicit target-specific output directory")
+        self.output_dir = output_dir
         self.text_only = text_only
         self.stats_only = stats_only
         self.verbose = verbose
@@ -51,6 +63,7 @@ class Disassembler:
 
         # Components (initialized during run)
         self.image: Optional[BinaryImage] = None
+        self.profile: Optional[TargetProfile] = None
         self.engine: Optional[DisasmEngine] = None
         self.labels: Optional[LabelManager] = None
         self.xrefs: Optional[XRefTracker] = None
@@ -65,14 +78,25 @@ class Disassembler:
         """
         t_start = time.time()
 
+        if not self.analysis_json:
+            raise ValueError(
+                "an explicit parser analysis JSON is required; automatic selection "
+                "can mix databases from different targets"
+            )
+        json_path = self.analysis_json
+        self.profile = load_target_profile(
+            profile_path=self.target_profile_path,
+            analysis_json=json_path,
+            xbe_path=self.xbe_path,
+        )
+
         # Check cache
         cache = AnalysisCache(self.output_dir)
         if not self.force:
-            json_path = self._find_analysis_json()
-            if json_path and cache.is_valid(self.xbe_path, json_path,
-                                             self.text_only,
-                                             self.extra_sections,
-                                             self.seed_functions):
+            if json_path and cache.is_valid(
+                    self.xbe_path, json_path, self.text_only,
+                    self.extra_sections, self.seed_functions,
+                    self.target_profile_path):
                 last_time = cache.get_last_run_time()
                 print(f"Cache hit - results unchanged (last run: "
                       f"{last_time:.1f}s)")
@@ -83,7 +107,7 @@ class Disassembler:
         # Phase 1: Load
         if self.verbose:
             print("Phase 1: Loading binary image...")
-        self.image = load_image(self.xbe_path, self.analysis_json)
+        self.image = load_image(self.xbe_path, json_path)
         if self.verbose:
             print(f"  Loaded: {self.image.filepath}")
             print(f"  Base: 0x{self.image.base_address:08X}  "
@@ -201,11 +225,12 @@ class Disassembler:
                 self.xrefs, self.labels, self.image, self.strings)
             writer.write_all(sections_to_disasm=sections, verbose=self.verbose)
 
-            # Save cache
-            json_path = self._find_analysis_json()
-            if json_path:
-                cache.save(self.xbe_path, json_path, self.text_only, elapsed,
-                           self.extra_sections, self.seed_functions)
+            # Save cache against the explicit target analysis and profile.
+            cache.save(
+                self.xbe_path, json_path, self.text_only, elapsed,
+                self.extra_sections, self.seed_functions,
+                self.target_profile_path,
+            )
 
             if self.verbose:
                 print(f"\n  Output written to {self.output_dir}/")
@@ -214,42 +239,52 @@ class Disassembler:
         return True
 
     def _get_target_sections(self) -> List[SectionInfo]:
-        """Determine which sections to disassemble."""
+        """Determine which exact-target sections are approved for disassembly."""
+        assert self.image is not None
         if self.text_only:
-            sections = []
             text = self.image.get_section(".text")
             if text is None:
                 raise ValueError("No .text section found")
-            sections.append(text)
+            sections = [text]
+        elif self.profile is not None:
+            sections = []
+            for profile_section in self.profile.code_sections:
+                section = self.image.get_section(profile_section.name)
+                if section is None:
+                    raise ValueError(
+                        f"Target profile section {profile_section.name!r} is absent from the XBE"
+                    )
+                if section.raw_size == 0:
+                    raise ValueError(
+                        f"Target profile marks {profile_section.name!r} as code, "
+                        "but the section has no raw bytes"
+                    )
+                sections.append(section)
         else:
-            # All executable sections with code
             sections = list(self.image.get_code_sections())
 
-        # Add extra sections (for sections marked non-executable but containing code)
         if self.extra_sections:
-            existing_names = {s.name for s in sections}
+            approved = (
+                {section.name for section in self.profile.code_sections}
+                if self.profile is not None else None
+            )
+            existing_names = {section.name for section in sections}
             for name in self.extra_sections:
                 if name in existing_names:
                     continue
-                sec = self.image.get_section(name)
-                if sec is None:
-                    print(f"  Warning: extra section '{name}' not found in XBE")
-                elif sec.raw_size == 0:
-                    print(f"  Warning: extra section '{name}' has no raw data")
-                else:
-                    print(f"  Adding extra section '{name}' (VA=0x{sec.virtual_addr:08X}, "
-                          f"size={sec.raw_size} bytes, executable={sec.executable})")
-                    sections.append(sec)
+                if approved is not None and name not in approved:
+                    raise ValueError(
+                        f"Extra section {name!r} is not approved as code by target profile "
+                        f"{self.profile.profile_id!r}; update and revalidate the profile"
+                    )
+                section = self.image.get_section(name)
+                if section is None:
+                    raise ValueError(f"Extra section {name!r} was not found in the XBE")
+                if section.raw_size == 0:
+                    raise ValueError(f"Extra section {name!r} has no raw data")
+                sections.append(section)
 
         return sections
-
-    def _find_analysis_json(self) -> Optional[str]:
-        """Find the analysis JSON file path."""
-        if self.analysis_json:
-            return self.analysis_json
-
-        found = _find_analysis_json(Path(self.xbe_path))
-        return str(found) if found else None
 
     def _load_and_print_cached_stats(self) -> None:
         """Load and print stats from cached summary.json."""

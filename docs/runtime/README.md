@@ -1,54 +1,81 @@
-# Runtime Implementation Guide
+# Runtime implementation guide
 
-The recompiled C code needs a host environment to run. This directory documents the four major runtime subsystems you need to build for each game.
+The generated C code needs a host runtime. The shared runtime is target-neutral:
+its target identity comes from a validated target profile and the exact XBE, not
+from copied Burnout 3 or Xbox Dashboard constants.
 
-## The Four Pillars
+## Required initialization order
 
-### 1. Memory Layout (`xbox_memory.c`)
+1. Load the exact XBE used to create the parser analysis and target profile.
+2. Call `xbox_MemoryLayoutInit()` to validate and load all XBE sections, decode
+   the title thunk table, and allocate non-overlapping runtime memory.
+3. Save `xbox_GetMemoryOffset()` in `g_xbox_mem_offset`.
+4. Initialize the kernel implementation with `xbox_kernel_init()`.
+5. Configure explicit game/save paths with `xbox_path_init()`.
+6. Call `xbox_kernel_bridge_init()` and stop if it rejects the target thunk table.
+7. Set `g_esp = XBOX_STACK_TOP` only after memory initialization succeeds.
+8. Initialize graphics, audio, and input surfaces required by the exact title.
+9. Invoke `XBOX_TARGET_ENTRY_POINT` through the generated target dispatch.
 
-Reproduce the Xbox's 64 MB address space at the correct virtual addresses. This is the most critical piece — get it wrong and nothing else works.
+The current `templates/new-game` project generates `target_profile.h` during the
+build only after the profile, parser JSON, and exact XBE agree.
 
-See: [../technical/memory-layout.md](../technical/memory-layout.md)
+## Runtime surfaces
 
-Template: [../../templates/runtime/xbox_memory.h](../../templates/runtime/xbox_memory.h)
+### Memory and target layout
 
-### 2. Kernel Shim (`xbox_kernel.c`)
+`src/kernel/xbox_memory_layout.c` creates the 64 MB backing store, true mirror
+aliases, loads every validated XBE section, and selects safe gaps for kernel data,
+the simulated stack, and the runtime heap. Do not copy section/stack/heap
+addresses into a game project.
 
-Replace the 147 Xbox kernel imports with Win32 equivalents. Most can be stubbed (return STATUS_SUCCESS). The critical ones are memory allocation and file I/O.
+See [memory-layout.md](../technical/memory-layout.md) and
+[target-profiles.md](../technical/target-profiles.md).
 
-See: [../technical/kernel-replacement.md](../technical/kernel-replacement.md)
+### Kernel replacement
 
-Template: [../../templates/runtime/kernel_stubs.h](../../templates/runtime/kernel_stubs.h)
+The current title's XBE supplies its kernel-thunk address and populated slots.
+The bridge validates and patches that table at runtime. Individual ordinal
+implementations range from complete behavior to partial compatibility or
+accepting stubs; report the exact surface actually tested.
 
-### 3. Graphics Translation (`d3d8_to_d3d11.c`)
+See [kernel-replacement.md](../technical/kernel-replacement.md).
 
-The Xbox uses a modified Direct3D 8. You need a translation layer to D3D11 (or D3D12, Vulkan, etc.). This is the largest runtime component.
+### Graphics
 
-See: [../technical/d3d-translation.md](../technical/d3d-translation.md)
+Titles can use D3D8 entry points, D3D8LTCG state, direct NV2A MMIO, and push
+buffers in different combinations. Windows and POSIX builds do not currently
+compile identical backends, so validate each selected host path independently.
+Reference-title NV2A replay/font fixtures are opt-in and are not shared target
+configuration.
 
-### 4. Input System (`xbox_input.c`)
+See [d3d-translation.md](../technical/d3d-translation.md) and
+[`../../src/nv2a/README.md`](../../src/nv2a/README.md).
 
-Map Xbox controller input to Windows XInput. This is usually the simplest piece — Xbox controllers on Windows are nearly 1:1.
+### Audio
 
-## Build System
+DirectSound and MCPX APU compatibility are separate layers. A successful object
+creation or accepted call does not prove audible or accurate output. Validate
+the active host backend, format conversion, voice state, streaming, and timing.
 
-We recommend CMake with MSVC. Structure your project as static libraries:
+### Input
 
-```
-src/
-├── kernel/     → xbox_kernel.lib
-├── d3d/        → d3d_translation.lib
-├── audio/      → audio_stubs.lib
-├── input/      → input_layer.lib
-└── game/       → your_game.exe (links all the above + recompiled code)
-```
+Map Xbox controller state to the active host input backend, including capability
+queries, connected-port state, analog ranges, buttons, and vibration where
+implemented. Do not infer parity from matching structure names.
 
-## Game-Specific Components
+## Game-specific project code
 
-Beyond the four pillars, each game needs:
+Keep these outside the shared toolkit unless a change is demonstrably reusable:
 
-- **Manual function overrides** — hand-written replacements for functions that don't work when mechanically translated (physics, rendering orchestrators, hardware-specific code)
-- **Asset loaders** — each game/engine has its own file formats for textures, models, levels, audio, etc.
-- **Game-specific workarounds** — vtable guards for corrupted pointers, state machine patches, etc.
+- target profile annotations and evidence,
+- manual function overrides,
+- asset loaders and format definitions,
+- title state/context addresses,
+- game-specific renderer/audio workarounds,
+- parity scenarios and reference captures.
 
-These go in the game-specific repo, not in the generic xboxrecomp toolkit.
+Every manual override must preserve its Xbox VA, ABI, inputs, outputs, stack
+cleanup, evidence, validation, and remaining gap. Generated output remains
+disposable; fix the generator or use documented manual sources rather than
+editing generated files permanently.

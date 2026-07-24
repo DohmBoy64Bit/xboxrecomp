@@ -12,7 +12,8 @@ Hardware emulation of the Xbox's NV2A GPU (a custom NVIDIA chip derived from GeF
 | `nv2a_core.c` | 791 | Register read/write handlers for all GPU blocks + pgraph_method() |
 | `nv2a_mmio_hook.c` | 412 | VEH x86-64 instruction decoder for 0xFD000000+ MMIO |
 | `nv2a_mmio_hook.h` | 54 | MMIO hook public API |
-| `nv2a_pb_test.c` | 352 | Push buffer test harness (generates and validates GPU frames) |
+| `nv2a_pgraph_d3d11.c` | Host rendering translator for supported NV2A methods |
+| `nv2a_pb_test.c` / `nv2a_pb_replay.c` | Burnout 3 reference fixtures; excluded from the default target-neutral build |
 
 ## Quick Start
 
@@ -211,9 +212,15 @@ void pgraph_method(NV2AState *d, uint32_t subchannel, uint32_t method, uint32_t 
 // - SET_FLIP_WRITE/FLIP_STALL: page flip
 ```
 
-## Push Buffer Test
+## Reference Push-Buffer Fixtures
 
-`nv2a_pb_test.c` validates the pipeline by generating a complete frame:
+`nv2a_pb_test.c` and `nv2a_pb_replay.c` contain captured Burnout 3 addresses and menu data. They are research/regression fixtures, not generic target configuration, and are excluded from the default build. Enable them explicitly only when validating that reference target:
+
+```bash
+cmake -S . -B build -DXBOXRECOMP_BUILD_BURNOUT3_NV2A_FIXTURES=ON
+```
+
+When enabled, `nv2a_pb_test.c` can generate a reference frame:
 
 ```c
 // Generates 80 dwords of GPU commands:
@@ -227,14 +234,7 @@ void pgraph_method(NV2AState *d, uint32_t subchannel, uint32_t method, uint32_t 
 nv2a_pb_test_frame();
 ```
 
-To customize the push buffer addresses for your game:
-
-```c
-// Define BEFORE including nv2a_pb_test.c or in your CMakeLists:
-#define PB_BASE_ADDR   0x35D69C  // Your game's PB base pointer address
-#define PB_WRITE_ADDR  0x35D6A0  // Your game's PB write pointer address
-#define PB_END_ADDR    0x35D6A4  // Your game's PB end pointer address
-```
+Do not customize those fixture macros in the shared runtime for a new title. Discover the new title's push-buffer behavior from its exact XBE and runtime evidence, then place target-only addresses or capture data in the target project or a separately named opt-in fixture.
 
 ## QEMU Shim Layer
 
@@ -260,9 +260,10 @@ SET_MASK(v, mask, val)// Set masked field
 
 ## Current Limitations
 
-- **PGRAPH is register-level only** — no actual 3D rendering. Push buffer methods update register state and track frame statistics, but don't produce pixels.
-- **PFIFO is simplified** — no hardware channel switching. Commands are processed synchronously.
-- **No shader execution** — NV2A vertex/pixel programs are not emulated.
-- **No texture fetch** — Texture state is tracked but not sampled.
+- PFIFO/channel behavior is simplified and must be validated per title.
+- `nv2a_pgraph_d3d11.c` translates a supported subset of methods; its presence does not prove complete NV2A semantics or rendering parity.
+- The Windows D3D11 path and POSIX/OpenGL build path are materially different and require independent tests.
+- Reference Burnout texture/font lookup is disabled unless the explicit fixture option is enabled.
+- Unsupported shader, texture, synchronization, or push-buffer behavior must remain visible in runtime logs and parity reports.
 
-For actual rendering, use `xbox_d3d8` (the D3D8→D3D11 layer) or build a rendering backend that reads PGRAPH state and issues D3D11 draw calls.
+Use `xbox_d3d8` and the PGRAPH translator only for the surfaces they demonstrably implement. Add reusable behavior to the shared runtime; keep game-specific captures and addresses in the target project or opt-in fixtures.

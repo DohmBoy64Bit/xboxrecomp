@@ -429,14 +429,10 @@ typedef VOID (*PIO_APC_ROUTINE)(
  * ============================================================================ */
 
 /*
- * The kernel thunk table is an array of function pointers at a game-specific VA.
- * The address is parsed from the XBE header at runtime. Game code calls kernel
- * functions via: call [thunk_addr]. We fill this table with our xbox_* implementations.
- *
- * Legacy define for backward compatibility (Burnout 3 address).
- * New code should use xbox_kernel_set_thunk_address() instead.
+ * The kernel thunk table is an array of function pointers at a title-specific
+ * Xbox virtual address. The address is decoded from the exact XBE header at
+ * runtime; there is intentionally no reference-title fallback.
  */
-#define XBOX_KERNEL_THUNK_TABLE_BASE  0x0036B7C0  /* default; overridden at runtime */
 /* The real kernel's export directory has 378 slots, of which 371 are exported
  * (ordinals 367-373 are null). Verified identical in xboxkrnl.exe from builds
  * 3944, 4039 and 5455, so this is stable across the console's life. The old
@@ -444,20 +440,34 @@ typedef VOID (*PIO_APC_ROUTINE)(
  * importing more than 366 kernel functions would have overrun them.
  *
  * Note the kernel exports by ordinal only -- its export directory carries no
- * name table -- which is why ordinal->name mappings are reverse-engineered
- * (see KERNEL_EXPORTS in tools/xbe_parser). We have no names for 374-378.
+ * name table -- which is why ordinal-to-name mappings are reverse-engineered
+ * (see KERNEL_EXPORTS in tools/xbe_parser). Ordinals 374-378 are mapped to the
+ * known debug-memory export names, but runtime implementations remain separate
+ * from name recovery and may still be unavailable.
  */
-#define XBOX_KERNEL_THUNK_TABLE_SIZE  378  /* export slots in xboxkrnl.exe */
+#define XBOX_KERNEL_MAX_ORDINAL       378u
+#define XBOX_KERNEL_EXPORT_TABLE_SIZE (XBOX_KERNEL_MAX_ORDINAL + 1u)
+#define XBOX_KERNEL_MAX_THUNK_SLOTS   378u
+
+/* Compatibility name for code that bounds title thunk slots. New code should
+ * use XBOX_KERNEL_MAX_THUNK_SLOTS or XBOX_KERNEL_EXPORT_TABLE_SIZE explicitly. */
+#define XBOX_KERNEL_THUNK_TABLE_SIZE  XBOX_KERNEL_MAX_THUNK_SLOTS
 
 /**
- * Set the kernel thunk table address for the current game.
- * Call this BEFORE xbox_kernel_bridge_init(). The address is parsed
- * from the XBE header's KernelImageThunkAddress field.
- * If not called, the default (Burnout 3's 0x0036B7C0) is used.
+ * Set the kernel thunk table address for the current target.
+ *
+ * Call this before xbox_kernel_bridge_init(). Passing zero for either argument
+ * clears the active table. The bridge refuses to initialize until a valid table
+ * has been supplied from the exact XBE header.
  */
 void xbox_kernel_set_thunk_address(uint32_t xbox_va, uint32_t count);
 
-extern ULONG_PTR xbox_kernel_thunk_table[XBOX_KERNEL_THUNK_TABLE_SIZE];
+/**
+ * Set the emulated Xbox kernel version from the target XBE library metadata.
+ */
+void xbox_kernel_set_version(USHORT major, USHORT minor, USHORT build, USHORT qfe);
+
+extern ULONG_PTR xbox_kernel_thunk_table[XBOX_KERNEL_EXPORT_TABLE_SIZE];
 
 /* Initialize the thunk table - must be called before game code runs */
 void xbox_kernel_init(void);
@@ -467,7 +477,7 @@ void xbox_kernel_shutdown(void);
 ULONG_PTR xbox_resolve_ordinal(ULONG ordinal);
 
 /* Kernel bridge (kernel_bridge.c) - resolve kernel thunks in Xbox memory */
-void xbox_kernel_bridge_init(void);
+BOOL xbox_kernel_bridge_init(void);
 
 /* ============================================================================
  * Path Translation (kernel_path.c)

@@ -6,10 +6,11 @@
  * absolute address (e.g., mov eax, [0x004D532C]).
  *
  * Implementation:
- * 1. VirtualAlloc a contiguous region at XBOX_BASE_ADDRESS
- * 2. Copy .rdata and initialized .data from the XBE
- * 3. Zero-fill the BSS region
- * 4. Set memory protection (read-only for .rdata)
+ * 1. Create a shared 64 MB Xbox RAM backing store and true mirror views.
+ * 2. Parse and validate the exact XBE header and every section range.
+ * 3. Copy initialized bytes and zero each section's virtual tail.
+ * 4. Select non-overlapping runtime ranges for kernel data, stack, and heap.
+ * 5. Decode target-specific kernel metadata without reference-title fallbacks.
  */
 
 #include "xbox_memory_layout.h"
@@ -23,6 +24,16 @@
 #define XBE_HEADER_SIZE_OFFSET  0x0108
 #define XBE_SECTION_COUNT_OFFSET 0x011C
 #define XBE_SECTION_HEADERS_OFFSET 0x0120
+#define XBE_ENTRY_POINT_OFFSET     0x0128
+#define XBE_KERNEL_THUNK_OFFSET    0x0158
+#define XBE_LIBRARY_COUNT_OFFSET   0x0160
+#define XBE_LIBRARY_ADDR_OFFSET    0x0164
+#define XBE_KERNEL_LIB_OFFSET      0x0168
+
+#define ENTRY_RETAIL_XOR  0xA8FC57ABu
+#define ENTRY_DEBUG_XOR   0x94859D4Bu
+#define THUNK_RETAIL_XOR  0x5B6D40B6u
+#define THUNK_DEBUG_XOR   0xEFB1F152u
 
 /* XBE section header layout (56 bytes each) */
 #define SECTHDR_FLAGS       0x00
@@ -36,6 +47,15 @@
 static void *g_memory_base = NULL;
 static size_t g_memory_size = 0;
 static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
+
+uint32_t g_xbox_kernel_data_base = 0;
+uint32_t g_xbox_stack_base = 0;
+uint32_t g_xbox_stack_top = 0;
+uint32_t g_xbox_heap_base = 0;
+uint32_t g_xbox_heap_size = 0;
+
+static uint32_t g_fs28_context_va = 0;
+static uint32_t g_heap_next = 0;
 
 /* File mapping handle for the Xbox memory region.
  * Using CreateFileMapping + MapViewOfFileEx allows mirror views to alias
@@ -66,6 +86,220 @@ volatile uint32_t g_icall_trace[16] = {0};
 volatile uint32_t g_icall_trace_idx = 0;
 volatile uint64_t g_icall_count = 0;
 
+typedef struct _XBOX_VA_RANGE {
+    uint32_t start;
+    uint32_t end;
+} XBOX_VA_RANGE;
+
+static uint32_t align_up_u32(uint32_t value, uint32_t alignment)
+{
+    return (value + alignment - 1u) & ~(alignment - 1u);
+}
+
+static void sort_ranges(XBOX_VA_RANGE *ranges, uint32_t count)
+{
+    for (uint32_t i = 1; i < count; i++) {
+        XBOX_VA_RANGE value = ranges[i];
+        uint32_t j = i;
+        while (j > 0 && ranges[j - 1].start > value.start) {
+            ranges[j] = ranges[j - 1];
+            j--;
+        }
+        ranges[j] = value;
+    }
+}
+
+static void consider_runtime_gap(
+    uint32_t gap_start,
+    uint32_t gap_end,
+    uint32_t *best_start,
+    uint32_t *best_end)
+{
+    const uint32_t minimum_heap_size = 4u * 1024u * 1024u;
+    const uint32_t alignment = 0x10000u;
+    uint32_t kernel_base;
+    uint32_t stack_base;
+    uint32_t heap_base;
+    uint32_t candidate_heap_size;
+    uint32_t current_heap_size = 0;
+
+    if (gap_start >= gap_end) {
+        return;
+    }
+    kernel_base = align_up_u32(gap_start, alignment);
+    if (kernel_base >= gap_end) {
+        return;
+    }
+    stack_base = align_up_u32(kernel_base + XBOX_KERNEL_DATA_SIZE, alignment);
+    if (stack_base > UINT32_MAX - XBOX_STACK_SIZE) {
+        return;
+    }
+    heap_base = stack_base + XBOX_STACK_SIZE;
+    if (heap_base > gap_end || gap_end - heap_base < minimum_heap_size) {
+        return;
+    }
+    candidate_heap_size = gap_end - heap_base;
+    if (*best_end != 0) {
+        uint32_t current_stack_base = align_up_u32(
+            *best_start + XBOX_KERNEL_DATA_SIZE, alignment);
+        uint32_t current_heap_base = current_stack_base + XBOX_STACK_SIZE;
+        current_heap_size = *best_end - current_heap_base;
+    }
+    if (*best_end == 0 || candidate_heap_size > current_heap_size) {
+        *best_start = kernel_base;
+        *best_end = gap_end;
+    }
+}
+
+static BOOL configure_runtime_layout(XBOX_VA_RANGE *occupied, uint32_t count)
+{
+    uint32_t cursor = XBOX_MAP_START;
+    uint32_t best_start = 0;
+    uint32_t best_end = 0;
+
+    sort_ranges(occupied, count);
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t start = occupied[i].start;
+        uint32_t end = occupied[i].end;
+        if (start > XBOX_TOTAL_RAM) {
+            start = XBOX_TOTAL_RAM;
+        }
+        if (end > XBOX_TOTAL_RAM) {
+            end = XBOX_TOTAL_RAM;
+        }
+        if (start > cursor) {
+            consider_runtime_gap(cursor, start, &best_start, &best_end);
+        }
+        if (end > cursor) {
+            cursor = end;
+        }
+    }
+    if (cursor < XBOX_TOTAL_RAM) {
+        consider_runtime_gap(cursor, XBOX_TOTAL_RAM, &best_start, &best_end);
+    }
+    if (best_end == 0) {
+        fprintf(stderr,
+                "xbox_MemoryLayoutInit: no free Xbox RAM gap can hold kernel "
+                "data, the %u MB simulated stack, and a 4 MB minimum heap\n",
+                XBOX_STACK_SIZE / (1024u * 1024u));
+        return FALSE;
+    }
+
+    g_xbox_kernel_data_base = best_start;
+    g_xbox_stack_base = align_up_u32(
+        g_xbox_kernel_data_base + XBOX_KERNEL_DATA_SIZE, 0x10000u);
+    g_xbox_stack_top = g_xbox_stack_base + XBOX_STACK_SIZE - 16u;
+    g_xbox_heap_base = g_xbox_stack_base + XBOX_STACK_SIZE;
+    g_xbox_heap_size = best_end - g_xbox_heap_base;
+    g_heap_next = g_xbox_heap_base;
+    return TRUE;
+}
+
+static uint32_t validate_thunk_candidate(uint32_t thunk_va)
+{
+    uint32_t count = 0;
+
+    if (thunk_va < XBOX_BASE_ADDRESS ||
+        thunk_va > XBOX_TOTAL_RAM - XBOX_KERNEL_MAX_THUNK_SLOTS * 4u ||
+        (thunk_va & 3u) != 0) {
+        return 0;
+    }
+
+    for (uint32_t slot = 0; slot < XBOX_KERNEL_MAX_THUNK_SLOTS; slot++) {
+        uint32_t entry = *(volatile uint32_t *)
+            ((uintptr_t)(thunk_va + slot * 4u) + g_memory_offset);
+        if (entry == 0) {
+            return count;
+        }
+        if ((entry & 0x80000000u) == 0 ||
+            (entry & 0x7FFFFFFFu) == 0 ||
+            (entry & 0x7FFFFFFFu) > XBOX_KERNEL_MAX_ORDINAL) {
+            return 0;
+        }
+        count++;
+    }
+    return count;
+}
+
+static BOOL configure_target_thunks(const uint8_t *xbe, size_t xbe_size)
+{
+    uint32_t entry_raw;
+    uint32_t thunk_raw;
+    uint32_t base_addr;
+    uint32_t image_size;
+    uint32_t retail_entry;
+    uint32_t debug_entry;
+    uint32_t thunk_va;
+    uint32_t thunk_count;
+    BOOL is_debug;
+
+    if (xbe_size < XBE_KERNEL_THUNK_OFFSET + sizeof(uint32_t)) {
+        return FALSE;
+    }
+
+    base_addr = *(const uint32_t *)(xbe + XBE_BASE_ADDR_OFFSET);
+    image_size = *(const uint32_t *)(xbe + 0x010C);
+    if (base_addr < XBOX_BASE_ADDRESS || image_size == 0 ||
+        base_addr > XBOX_TOTAL_RAM - image_size) {
+        fprintf(stderr, "xbox_MemoryLayoutInit: invalid XBE image range\n");
+        return FALSE;
+    }
+    entry_raw = *(const uint32_t *)(xbe + XBE_ENTRY_POINT_OFFSET);
+    thunk_raw = *(const uint32_t *)(xbe + XBE_KERNEL_THUNK_OFFSET);
+    retail_entry = entry_raw ^ ENTRY_RETAIL_XOR;
+    debug_entry = entry_raw ^ ENTRY_DEBUG_XOR;
+
+    if (retail_entry >= base_addr && retail_entry < base_addr + image_size) {
+        is_debug = FALSE;
+    } else if (debug_entry >= base_addr && debug_entry < base_addr + image_size) {
+        is_debug = TRUE;
+    } else {
+        fprintf(stderr, "xbox_MemoryLayoutInit: cannot identify XBE retail/debug encoding\n");
+        return FALSE;
+    }
+
+    thunk_va = thunk_raw ^ (is_debug ? THUNK_DEBUG_XOR : THUNK_RETAIL_XOR);
+    thunk_count = validate_thunk_candidate(thunk_va);
+    if (thunk_count == 0) {
+        fprintf(stderr,
+                "xbox_MemoryLayoutInit: invalid %s kernel thunk table at 0x%08X\n",
+                is_debug ? "debug" : "retail", thunk_va);
+        return FALSE;
+    }
+
+    xbox_kernel_set_thunk_address(thunk_va, thunk_count);
+    fprintf(stderr, "  Kernel thunks: %u entries at Xbox VA 0x%08X (%s)\n",
+            thunk_count, thunk_va, is_debug ? "debug" : "retail");
+    return TRUE;
+}
+
+static void configure_target_kernel_version(const uint8_t *xbe, size_t xbe_size)
+{
+    uint32_t base_addr;
+    uint32_t kernel_version_va;
+    uint32_t kernel_version_off;
+
+    if (xbe_size < XBE_KERNEL_LIB_OFFSET + sizeof(uint32_t)) {
+        return;
+    }
+
+    base_addr = *(const uint32_t *)(xbe + XBE_BASE_ADDR_OFFSET);
+    kernel_version_va = *(const uint32_t *)(xbe + XBE_KERNEL_LIB_OFFSET);
+    if (kernel_version_va < base_addr) {
+        return;
+    }
+    kernel_version_off = kernel_version_va - base_addr;
+    if (kernel_version_off + 16u > xbe_size) {
+        return;
+    }
+
+    xbox_kernel_set_version(
+        *(const uint16_t *)(xbe + kernel_version_off + 8u),
+        *(const uint16_t *)(xbe + kernel_version_off + 10u),
+        *(const uint16_t *)(xbe + kernel_version_off + 12u),
+        *(const uint16_t *)(xbe + kernel_version_off + 14u) & 0x1FFFu);
+}
+
 BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 {
     DWORD old_protect;
@@ -75,6 +309,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         fprintf(stderr, "xbox_MemoryLayoutInit: already initialized\n");
         return FALSE;
     }
+    if (!xbe || xbe_size < 0x0178 || memcmp(xbe + XBE_MAGIC_OFFSET, "XBEH", 4) != 0) {
+        fprintf(stderr, "xbox_MemoryLayoutInit: invalid or truncated XBE input\n");
+        return FALSE;
+    }
+
+    xbox_kernel_set_thunk_address(0, 0);
 
     /*
      * Calculate the full range we need to map.
@@ -105,8 +345,8 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         NULL                    /* unnamed mapping */
     );
     if (!g_mapping_handle) {
-        fprintf(stderr, "xbox_MemoryLayoutInit: CreateFileMapping failed (error %lu)\n",
-                GetLastError());
+        fprintf(stderr, "xbox_MemoryLayoutInit: CreateFileMapping failed (error %u)\n",
+                (unsigned int)GetLastError());
         return FALSE;
     }
 
@@ -126,18 +366,20 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             0,                      /* sentinel - let OS choose */
         };
 
-        for (int i = 0; try_bases[i] != 0 || i == 0; i++) {
+        const size_t try_base_count = sizeof(try_bases) / sizeof(try_bases[0]);
+
+        for (size_t i = 0; i < try_base_count; i++) {
             LPVOID hint = try_bases[i] ? (LPVOID)try_bases[i] : NULL;
             g_memory_base = MapViewOfFileEx(
                 g_mapping_handle,
                 FILE_MAP_ALL_ACCESS,
                 0, 0,           /* offset into mapping */
                 g_memory_size,  /* size */
-                hint            /* desired base address */
+                hint            /* desired base address or NULL */
             );
             if (g_memory_base) {
                 if (try_bases[i] != 0 && (uintptr_t)g_memory_base != try_bases[i]) {
-                    /* OS gave us a different address, retry */
+                    /* OS gave us a different address for a fixed hint, retry. */
                     UnmapViewOfFile(g_memory_base);
                     g_memory_base = NULL;
                     continue;
@@ -213,14 +455,56 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
         DWORD sect_headers_off = sect_headers_va - base_addr;
         int sections_loaded = 0;
         size_t total_bytes = 0;
+        XBOX_VA_RANGE occupied[65];
+        uint32_t occupied_count = 1;
+        DWORD header_size = *(const DWORD *)(xbe + XBE_HEADER_SIZE_OFFSET);
 
-        if (num_sections > 64) num_sections = 64;  /* sanity cap */
+        if (header_size == 0 || header_size > xbe_size ||
+            base_addr > XBOX_TOTAL_RAM - header_size) {
+            fprintf(stderr, "xbox_MemoryLayoutInit: invalid XBE header size\n");
+            xbox_MemoryLayoutShutdown();
+            return FALSE;
+        }
+        occupied[0].start = XBOX_MAP_START;
+        occupied[0].end = base_addr + header_size;
+
+        if (num_sections == 0 || num_sections > 64 ||
+            sect_headers_va < base_addr ||
+            sect_headers_off + num_sections * SECTHDR_SIZE > xbe_size) {
+            fprintf(stderr, "xbox_MemoryLayoutInit: invalid XBE section table\n");
+            xbox_MemoryLayoutShutdown();
+            return FALSE;
+        }
+
+        for (DWORD si = 0; si < num_sections; si++) {
+            const uint8_t *sh = xbe + sect_headers_off + si * SECTHDR_SIZE;
+            DWORD sec_va = *(const DWORD *)(sh + SECTHDR_VA);
+            DWORD sec_vsize = *(const DWORD *)(sh + SECTHDR_VSIZE);
+            if (sec_vsize == 0 || sec_va < XBOX_BASE_ADDRESS ||
+                sec_va > XBOX_TOTAL_RAM - sec_vsize) {
+                fprintf(stderr, "xbox_MemoryLayoutInit: invalid section %u virtual range\n", si);
+                xbox_MemoryLayoutShutdown();
+                return FALSE;
+            }
+            occupied[occupied_count].start = sec_va;
+            occupied[occupied_count].end = sec_va + sec_vsize;
+            occupied_count++;
+        }
+
+        if (!configure_runtime_layout(occupied, occupied_count)) {
+            xbox_MemoryLayoutShutdown();
+            return FALSE;
+        }
 
         fprintf(stderr, "  XBE sections: %u (headers at file offset 0x%08X)\n",
                 num_sections, sect_headers_off);
+        fprintf(stderr,
+                "  Runtime layout: kernel-data=0x%08X stack=0x%08X-0x%08X "
+                "heap=0x%08X-0x%08X\n",
+                XBOX_KERNEL_DATA_BASE, XBOX_STACK_BASE, XBOX_STACK_TOP,
+                XBOX_HEAP_BASE, XBOX_HEAP_BASE + XBOX_HEAP_SIZE);
 
         for (DWORD si = 0; si < num_sections; si++) {
-            if (sect_headers_off + (si + 1) * SECTHDR_SIZE > xbe_size) break;
 
             const uint8_t *sh = xbe + sect_headers_off + si * SECTHDR_SIZE;
             DWORD sec_va       = *(const DWORD *)(sh + SECTHDR_VA);
@@ -235,9 +519,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             if (name_off < xbe_size && name_off + 8 <= xbe_size)
                 sec_name = (const char *)(xbe + name_off);
 
-            /* Validate: section must fit within our 64MB mapped region */
-            if (sec_va < XBOX_BASE_ADDRESS || sec_va + sec_vsize > XBOX_TOTAL_RAM)
-                continue;
+            if (sec_raw_size > 0 &&
+                (sec_raw_off > xbe_size || sec_raw_size > xbe_size - sec_raw_off)) {
+                fprintf(stderr, "xbox_MemoryLayoutInit: section %u exceeds XBE bytes\n", si);
+                xbox_MemoryLayoutShutdown();
+                return FALSE;
+            }
 
             /* Determine copy size (raw_size may exceed vsize due to alignment) */
             DWORD copy_size = (sec_raw_size < sec_vsize) ? sec_raw_size : sec_vsize;
@@ -262,41 +549,17 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 sections_loaded, num_sections, total_bytes);
     }
 
-    /*
-     * Parse the kernel thunk table address from the XBE header.
-     * The XBE stores KernelImageThunkAddress at offset 0x0158,
-     * XOR-encrypted with 0x5B6D40B6 for retail builds.
-     * We decrypt it and tell the kernel bridge where to find thunks.
-     */
-    if (xbe_size >= 0x015C) {
-        uint32_t thunk_raw = *(const uint32_t *)(xbe + 0x0158);
-        uint32_t thunk_va = thunk_raw ^ 0x5B6D40B6;  /* retail XOR key */
-
-        /* Validate: thunk VA should be within our mapped region */
-        if (thunk_va >= XBOX_BASE_ADDRESS && thunk_va < XBOX_TOTAL_RAM) {
-            /* Count thunk entries by scanning until we hit 0 */
-            uint32_t thunk_count = 0;
-            for (uint32_t t = 0; t < 366; t++) {
-                uint32_t entry = *(volatile uint32_t *)((uintptr_t)(thunk_va + t * 4) + g_memory_offset);
-                if (entry == 0) break;
-                thunk_count++;
-            }
-            xbox_kernel_set_thunk_address(thunk_va, thunk_count);
-            fprintf(stderr, "  Kernel thunks: %u entries at Xbox VA 0x%08X\n",
-                    thunk_count, thunk_va);
-        } else {
-            fprintf(stderr, "  WARNING: kernel thunk VA 0x%08X out of range (raw=0x%08X)\n",
-                    thunk_va, thunk_raw);
-        }
+    if (!configure_target_thunks(xbe, xbe_size)) {
+        xbox_MemoryLayoutShutdown();
+        return FALSE;
     }
+    configure_target_kernel_version(xbe, xbe_size);
 
     /*
-     * NOTE: .rdata is NOT set read-only.
-     * VirtualProtect rounds to page boundaries, and the .rdata end (0x003B2454)
-     * and .data start (0x003B2360) share the same 4KB page (0x003B2000-0x003B2FFF).
-     * Making .rdata read-only also makes the first ~0xCA0 bytes of .data read-only,
-     * which causes game initialization code to fault when writing to .data globals
-     * in that overlap range.
+     * Section protections are not applied piecemeal here. Adjacent XBE sections
+     * may share host pages, so title-neutral protection requires a page-aware
+     * plan derived from the complete section table rather than reference-title
+     * boundaries.
      */
     (void)old_protect;
 
@@ -329,7 +592,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
      *   fs:[0x20] = KPCR Prcb pointer (→ fake structure)
      *   fs:[0x28] = TLS / RW engine context pointer
      *
-     * We use free space in the BSS area for the fake structures.
+     * Shared fields are initialized only from target-neutral runtime state.
      */
     {
         #define XBOX_VA(va) ((void *)((uintptr_t)(va) + g_memory_offset))
@@ -349,24 +612,12 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
          */
         MEM32_INIT(0x20, 0x00000000);
 
-        /*
-         * fs:[0x28] - Thread local storage / RW engine context.
-         * The RW engine reads [fs:[0x28] + 0x28] to get a pointer
-         * to its data area. We allocate a fake structure at 0x00760000
-         * (in the BSS area) and a data buffer at 0x00700000.
-         */
-        #define FAKE_TLS_VA     0x00760000  /* Fake TLS structure (in BSS) */
-        #define FAKE_RWDATA_VA  0x00700000  /* RW engine data area (in BSS) */
+        /* fs:[0x28] is target-specific. Leave it zero unless the target
+         * supplies an evidence-backed context VA through the public setter. */
+        MEM32_INIT(0x28, g_fs28_context_va);
 
-        MEM32_INIT(0x28, FAKE_TLS_VA);
-        /* TLS[0x28] = pointer to RW data area */
-        MEM32_INIT(FAKE_TLS_VA + 0x28, FAKE_RWDATA_VA);
-
-        fprintf(stderr, "  TIB: fake TIB at VA 0x0, TLS at 0x%08X, RW data at 0x%08X\n",
-                FAKE_TLS_VA, FAKE_RWDATA_VA);
-
-        #undef FAKE_TLS_VA
-        #undef FAKE_RWDATA_VA
+        fprintf(stderr, "  TIB: emulated at VA 0x0, fs:[0x28]=0x%08X\n",
+                g_fs28_context_va);
         #undef MEM32_INIT
         #undef XBOX_VA
     }
@@ -441,8 +692,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             if (g_mirror_views[m]) {
                 mirrors_ok++;
             } else {
-                fprintf(stderr, "  Mirror %d: FAILED at %p (error %lu)\n",
-                        m + 1, (void *)mirror_base, GetLastError());
+                fprintf(stderr, "  Mirror %d: FAILED at %p (error %u)\n",
+                        m + 1, (void *)mirror_base,
+                        (unsigned int)GetLastError());
             }
         }
         fprintf(stderr, "  RAM mirror: %d/%d views mapped (covers %d MB)\n",
@@ -478,6 +730,15 @@ void xbox_MemoryLayoutShutdown(void)
         CloseHandle(g_mapping_handle);
         g_mapping_handle = NULL;
     }
+    g_memory_offset = 0;
+    g_xbox_mem_offset = 0;
+    g_xbox_kernel_data_base = 0;
+    g_xbox_stack_base = 0;
+    g_xbox_stack_top = 0;
+    g_xbox_heap_base = 0;
+    g_xbox_heap_size = 0;
+    g_heap_next = 0;
+    xbox_kernel_set_thunk_address(0, 0);
     fprintf(stderr, "xbox_MemoryLayoutShutdown: released\n");
 }
 
@@ -497,20 +758,30 @@ ptrdiff_t xbox_GetMemoryOffset(void)
     return g_memory_offset;
 }
 
+void xbox_MemoryLayoutSetFs28Context(uint32_t context_va)
+{
+    g_fs28_context_va = context_va;
+    if (g_memory_base) {
+        *(uint32_t *)((uintptr_t)0x28u + g_memory_offset) = context_va;
+    }
+}
+
 /* ── Dynamic heap allocator ────────────────────────────────
  *
  * Simple bump allocator for MmAllocateContiguousMemory and similar.
  * Returns Xbox VAs within the mapped region so MEM32() works correctly.
  * No free support (bump-only for now).
  */
-static uint32_t g_heap_next = XBOX_HEAP_BASE;
-
 static int g_heap_alloc_count = 0;
 
 uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
 
+    if (g_xbox_heap_base == 0 || g_xbox_heap_size == 0) {
+        fprintf(stderr, "xbox_HeapAlloc: memory layout is not initialized\n");
+        return 0;
+    }
     if (alignment < 4) alignment = 4;
 
     /* Enforce minimum allocation size.

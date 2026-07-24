@@ -1,0 +1,223 @@
+{
+  "schema_version": 1,
+  "profile_id": "xbox-dashboard-3944",
+  "title": "Xbox Dashboard build 3944 (reference profile)",
+  "base_address": "0x00010000",
+  "image_size": 1638400,
+  "entry_point": "0x00052A81",
+  "kernel_thunk_address": "0x00012000",
+  "sections": [
+    {
+      "name": ".text",
+      "virtual_address": "0x00012000",
+      "virtual_size": 636684,
+      "raw_address": "0x00002000",
+      "raw_size": 636684,
+      "executable": true,
+      "writable": false,
+      "role": "code"
+    },
+    {
+      "name": "D3D",
+      "virtual_address": "0x000AD720",
+      "virtual_size": 72432,
+      "raw_address": "0x0009E000",
+      "raw_size": 72432,
+      "executable": true,
+      "writable": false,
+      "role": "code",
+      "category": "game_render"
+    },
+    {
+      "name": "D3DX",
+      "virtual_address": "0x000BF220",
+      "virtual_size": 153536,
+      "raw_address": "0x000AD000",
+      "raw_size": 153536,
+      "executable": true,
+      "writable": false,
+      "role": "code",
+      "category": "game_render"
+    },
+    {
+      "name": "XGRPH",
+      "virtual_address": "0x000E49E0",
+      "virtual_size": 7624,
+      "raw_address": "0x000D3000",
+      "raw_size": 7624,
+      "executable": true,
+      "writable": false,
+      "role": "code",
+      "category": "game_render"
+    },
+    {
+      "name": "DSOUND",
+      "virtual_address": "0x000E67C0",
+      "virtual_size": 31344,
+      "raw_address": "0x000D5000",
+      "raw_size": 31344,
+      "executable": true,
+      "writable": false,
+      "role": "code",
+      "category": "game_audio"
+    },
+    {
+      "name": "WMADECXM",
+      "virtual_address": "0x000EE240",
+      "virtual_size": 4912,
+      "raw_address": "0x000DD000",
+      "raw_size": 4912,
+      "executable": true,
+      "writable": false,
+      "role": "code",
+      "category": "game_audio"
+    },
+    {
+      "name": "WMADEC",
+      "virtual_address": "0x000EF580",
+      "virtual_size": 101720,
+      "raw_address": "0x000DF000",
+      "raw_size": 101720,
+      "executable": true,
+      "writable": false,
+      "role": "code",
+      "category": "game_audio"
+    },
+    {
+      "name": "DVDTHUNK",
+      "virtual_address": "0x001082E0",
+      "virtual_size": 1116,
+      "raw_address": "0x000F8000",
+      "raw_size": 1116,
+      "executable": true,
+      "writable": false,
+      "role": "code"
+    },
+    {
+      "name": "XPP",
+      "virtual_address": "0x00108740",
+      "virtual_size": 31436,
+      "raw_address": "0x000F9000",
+      "raw_size": 31436,
+      "executable": true,
+      "writable": false,
+      "role": "code",
+      "category": "game_input"
+    },
+    {
+      "name": ".data",
+      "virtual_address": "0x00110220",
+      "virtual_size": 140392,
+      "raw_address": "0x00101000",
+      "raw_size": 140392,
+      "executable": false,
+      "writable": true,
+      "role": "data"
+    },
+    {
+      "name": "DOLBY",
+      "virtual_address": "0x001326A0",
+      "virtual_size": 28056,
+      "raw_address": "0x00113000",
+      "raw_size": 28056,
+      "executable": true,
+      "writable": false,
+      "role": "code",
+      "category": "game_audio"
+    },
+    {
+      "name": ".data1",
+      "virtual_address": "0x00139440",
+      "virtual_size": 7536,
+      "raw_address": "0x0011A000",
+      "raw_size": 7536,
+      "executable": false,
+      "writable": true,
+      "role": "data"
+    },
+    {
+      "name": "XIPS",
+      "virtual_address": "0x0013B1C0",
+      "virtual_size": 20760,
+      "raw_address": "0x0011C000",
+      "raw_size": 20760,
+      "executable": false,
+      "writable": false,
+      "role": "code"
+    },
+    {
+      "name": "EnglishXlate",
+      "virtual_address": "0x001402E0",
+      "virtual_size": 32428,
+      "raw_address": "0x00122000",
+      "raw_size": 32428,
+      "executable": false,
+      "writable": false,
+      "role": "resource"
+    },
+    {
+      "name": "JapaneseXlate",
+      "virtual_address": "0x001481A0",
+      "virtual_size": 27052,
+      "raw_address": "0x0012A000",
+      "raw_size": 27052,
+      "executable": false,
+      "writable": false,
+      "role": "resource"
+    },
+    {
+      "name": "GermanXlate",
+      "virtual_address": "0x0014EB60",
+      "virtual_size": 34148,
+      "raw_address": "0x00131000",
+      "raw_size": 34148,
+      "executable": false,
+      "writable": false,
+      "role": "resource"
+    },
+    {
+      "name": "FrenchXlate",
+      "virtual_address": "0x001570E0",
+      "virtual_size": 34772,
+      "raw_address": "0x0013A000",
+      "raw_size": 34772,
+      "executable": false,
+      "writable": false,
+      "role": "resource"
+    },
+    {
+      "name": "SpanishXlate",
+      "virtual_address": "0x0015F8C0",
+      "virtual_size": 34798,
+      "raw_address": "0x00143000",
+      "raw_size": 34798,
+      "executable": false,
+      "writable": false,
+      "role": "resource"
+    },
+    {
+      "name": "ItalianXlate",
+      "virtual_address": "0x001680C0",
+      "virtual_size": 34164,
+      "raw_address": "0x0014C000",
+      "raw_size": 34164,
+      "executable": false,
+      "writable": false,
+      "role": "resource"
+    }
+  ],
+  "special_functions": {},
+  "features": {
+    "renderware_identification": false
+  },
+  "classification": {
+    "game_subcategories": {}
+  },
+  "source": {
+    "kind": "legacy-config-migration",
+    "files": [
+      "tools/recomp/config.py"
+    ],
+    "warning": "Cross-check this profile against parser analysis from the exact dashboard XBE before production use."
+  }
+}

@@ -14,7 +14,7 @@
  * 8. Call the game's original entry point (recompiled)
  *
  * Customize this file for your game:
- *   - Set YOUR_GAME_ENTRY_POINT to the XBE entry point address
+ *   - Generate target_profile.h from the validated target profile
  *   - Set YOUR_GAME_XBE_PATH to where the XBE file lives
  *   - Set YOUR_GAME_DIR to the game data directory
  *   - Add any CRT global pre-initialization your game needs
@@ -36,8 +36,9 @@
 #include <string.h>
 #include <math.h>
 
-/* xboxrecomp runtime headers */
+/* xboxrecomp runtime headers and generated exact-target identity */
 #include <xbox/xboxrecomp.h>
+#include "target_profile.h"
 
 /*
  * If xboxrecomp.h is not an umbrella header in your setup, include
@@ -59,13 +60,10 @@ extern ptrdiff_t g_xbox_mem_offset;
 
 /* ── XBE Constants ─────────────────────────────────────────── */
 
-/*
- * TODO: Set these from your xbe_parser output.
- * Run: py -3 -m tools.xbe_parser game/default.xbe
- */
-#define YOUR_GAME_ENTRY_POINT   0x00000000  /* XBE entry point VA */
+/* File locations remain project configuration; addresses come from the
+ * generated target_profile.h and are cross-checked against the exact XBE. */
 #define YOUR_GAME_XBE_PATH      "game\\Your Game Title\\default.xbe"
-#define YOUR_GAME_DIR            "game\\Your Game Title"
+#define YOUR_GAME_DIR           "game\\Your Game Title"
 
 /* ── Forward declarations ──────────────────────────────────── */
 
@@ -198,9 +196,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
         xbox_path_init(YOUR_GAME_DIR, NULL);
     }
 
-    /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
+    /* Step 5: Initialize the exact target's kernel thunk bridge. */
     printf("Initializing kernel bridge...\n");
-    xbox_kernel_bridge_init();
+    if (!xbox_kernel_bridge_init()) {
+        MessageBoxA(NULL, "Failed to initialize the target kernel thunk table.",
+                    "Recomp", MB_ICONERROR);
+        xbox_MemoryLayoutShutdown();
+        free(xbe_data);
+        return 1;
+    }
 
     /* Step 6: Initialize stack */
     g_esp = XBOX_STACK_TOP;
@@ -220,7 +224,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
      */
 
     printf("\n=== Initialization complete ===\n");
-    printf("Entry point: 0x%08X\n", YOUR_GAME_ENTRY_POINT);
+    printf("Target: %s (%s)\n", XBOX_TARGET_TITLE, XBOX_TARGET_PROFILE_ID);
+    printf("Entry point: 0x%08X\n", XBOX_TARGET_ENTRY_POINT);
     printf("ESP: 0x%08X\n", g_esp);
 
     /* Step 7: Call the recompiled entry point */

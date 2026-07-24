@@ -8,10 +8,23 @@
 add_library(xbox_nv2a STATIC
     nv2a_core.c
     nv2a_pgraph_d3d11.c
-    nv2a_pb_replay.c
     nv2a_mmio_hook.c
-    nv2a_pb_test.c
 )
+
+# These sources contain captured Burnout 3 menu data and reference push-buffer
+# addresses. They are retained as opt-in research fixtures, never as part of the
+# target-neutral runtime selected by default.
+option(XBOXRECOMP_BUILD_BURNOUT3_NV2A_FIXTURES
+    "Build the Burnout 3 NV2A replay and push-buffer reference fixtures" OFF)
+if(XBOXRECOMP_BUILD_BURNOUT3_NV2A_FIXTURES)
+    target_sources(xbox_nv2a PRIVATE
+        nv2a_pb_replay.c
+        nv2a_pb_test.c
+    )
+    target_compile_definitions(xbox_nv2a PRIVATE
+        XBOXRECOMP_BURNOUT3_NV2A_FIXTURES=1
+    )
+endif()
 
 target_include_directories(xbox_nv2a PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 

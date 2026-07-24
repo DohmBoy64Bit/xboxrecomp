@@ -1,82 +1,113 @@
+"""Target-neutral configuration for function identification.
+
+Address ranges are populated from :class:`tools.target_profile.TargetProfile`
+before any analysis phase runs.  Static signature and confidence tables remain
+here because they are algorithm configuration rather than title addresses.
 """
-Configuration constants for the function identification tool.
 
-Defines section address ranges, CRT byte-level signatures, and
-confidence thresholds for each identification method.
-"""
+from __future__ import annotations
 
-# ============================================================
-# Section Address Ranges (from XBE analysis)
-# ============================================================
+from tools.target_profile import SectionProfile, TargetProfile
 
-# .text section: game code + CRT + RenderWare engine
-TEXT_VA_START = 0x00011000
-TEXT_VA_SIZE = 2863616
-TEXT_VA_END = TEXT_VA_START + TEXT_VA_SIZE  # 0x002BD000
-TEXT_RAW_ADDR = 0x00001000
-
-# .rdata section: read-only data (strings, vtables, constants)
-RDATA_VA_START = 0x0036B7C0
-RDATA_VA_SIZE = 289684
-RDATA_VA_END = RDATA_VA_START + RDATA_VA_SIZE  # 0x003B2394
-RDATA_RAW_ADDR = 0x0035C000
-
-# .data section
-DATA_VA_START = 0x003B2360
-DATA_VA_SIZE = 3904988
-DATA_VA_END = DATA_VA_START + DATA_VA_SIZE
-DATA_RAW_ADDR = 0x003A3000
-
-# XBE base address
-XBE_BASE_ADDRESS = 0x00010000
-
-# ============================================================
-# VA-to-file-offset helpers
-# ============================================================
-
-SECTIONS = [
-    # (name, va_start, va_size, raw_addr)
-    (".text",   0x00011000, 2863616, 0x00001000),
-    ("XMV",     0x002CC200, 163124,  0x002BD000),
-    ("DSOUND",  0x002F3F40, 52668,   0x002E5000),
-    ("WMADEC",  0x00300D00, 105828,  0x002F2000),
-    ("XONLINE", 0x0031AA80, 124764,  0x0030C000),
-    ("XNET",    0x003391E0, 78056,   0x0032B000),
-    ("D3D",     0x0034C2E0, 83828,   0x0033F000),
-    ("XGRPH",   0x00360A60, 8300,    0x00350000),
-    ("XPP",     0x00362AE0, 36052,   0x00353000),
-    (".rdata",  0x0036B7C0, 289684,  0x0035C000),
-    (".data",   0x003B2360, 3904988, 0x003A3000),
-    ("DOLBY",   0x0076B940, 29056,   0x0040C000),
-    ("XON_RD",  0x00772AC0, 5416,    0x00414000),
-    (".data1",  0x00774000, 224,     0x00416000),
-]
+ACTIVE_PROFILE: TargetProfile | None = None
+XBE_BASE_ADDRESS = 0
+TEXT_VA_START = 0
+TEXT_VA_SIZE = 0
+TEXT_VA_END = 0
+TEXT_RAW_ADDR = 0
+RDATA_VA_START = 0
+RDATA_VA_SIZE = 0
+RDATA_VA_END = 0
+RDATA_RAW_ADDR = 0
+DATA_VA_START = 0
+DATA_VA_SIZE = 0
+DATA_VA_END = 0
+DATA_RAW_ADDR = 0
+SECTIONS: list[tuple[str, int, int, int]] = []
+XDK_SECTIONS: dict[str, tuple[int, int, str]] = {}
+GAME_SUBCATEGORIES: dict[str, list[str]] = {}
 
 
-def va_to_file_offset(va):
-    """Convert a virtual address to a file offset in the XBE."""
-    for name, sec_va, sec_size, sec_raw in SECTIONS:
-        if sec_va <= va < sec_va + sec_size:
-            return va - sec_va + sec_raw
-    return None
+def configure_target(profile: TargetProfile) -> None:
+    """Populate compatibility fields from an explicit target profile."""
+    global ACTIVE_PROFILE
+    global XBE_BASE_ADDRESS
+    global TEXT_VA_START, TEXT_VA_SIZE, TEXT_VA_END, TEXT_RAW_ADDR
+    global RDATA_VA_START, RDATA_VA_SIZE, RDATA_VA_END, RDATA_RAW_ADDR
+    global DATA_VA_START, DATA_VA_SIZE, DATA_VA_END, DATA_RAW_ADDR
+    global SECTIONS, XDK_SECTIONS, GAME_SUBCATEGORIES
+
+    ACTIVE_PROFILE = profile
+    XBE_BASE_ADDRESS = profile.base_address
+    primary = profile.primary_code_section
+    TEXT_VA_START = primary.virtual_address
+    TEXT_VA_SIZE = primary.virtual_size
+    TEXT_VA_END = primary.virtual_end
+    TEXT_RAW_ADDR = primary.raw_address
+
+    read_only = profile.primary_read_only_section
+    data_sections = profile.data_sections
+    writable = next((section for section in data_sections if section.writable), None)
+    fallback = read_only or writable or (data_sections[0] if data_sections else None)
+    if fallback is None:
+        RDATA_VA_START = RDATA_VA_SIZE = RDATA_VA_END = RDATA_RAW_ADDR = 0
+        DATA_VA_START = DATA_VA_SIZE = DATA_VA_END = DATA_RAW_ADDR = 0
+    else:
+        read_only = read_only or fallback
+        writable = writable or fallback
+        RDATA_VA_START = read_only.virtual_address
+        RDATA_VA_SIZE = read_only.virtual_size
+        RDATA_VA_END = read_only.virtual_end
+        RDATA_RAW_ADDR = read_only.raw_address
+        DATA_VA_START = writable.virtual_address
+        DATA_VA_SIZE = writable.virtual_size
+        DATA_VA_END = writable.virtual_end
+        DATA_RAW_ADDR = writable.raw_address
+
+    SECTIONS = [
+        (section.name, section.virtual_address, section.virtual_size, section.raw_address)
+        for section in profile.sections
+    ]
+    XDK_SECTIONS = dict(profile.xdk_sections)
+    GAME_SUBCATEGORIES = {
+        category: list(keywords)
+        for category, keywords in (profile.game_subcategories or {}).items()
+    }
 
 
-# ============================================================
-# XDK Library Section Ranges (statically linked Xbox SDK libs)
-# ============================================================
-# Maps section name -> (va_start, va_end, game_category)
-# Functions calling into these sections get classified accordingly.
+def require_target() -> TargetProfile:
+    """Return the active profile or fail before target-bound analysis starts."""
+    if ACTIVE_PROFILE is None:
+        raise RuntimeError(
+            "function identification has no target profile; pass --analysis-json "
+            "and/or --target-profile"
+        )
+    return ACTIVE_PROFILE
 
-XDK_SECTIONS = {
-    "D3D":     (0x0034C2E0, 0x0034C2E0 + 83828,  "game_render"),
-    "DSOUND":  (0x002F3F40, 0x002F3F40 + 52668,  "game_audio"),
-    "WMADEC":  (0x00300D00, 0x00300D00 + 105828, "game_audio"),
-    "XMV":     (0x002CC200, 0x002CC200 + 163124, "game_video"),
-    "XONLINE": (0x0031AA80, 0x0031AA80 + 124764, "game_network"),
-    "XNET":    (0x003391E0, 0x003391E0 + 78056,  "game_network"),
-    "XGRPH":   (0x00360A60, 0x00360A60 + 8300,   "game_render"),
-    "XPP":     (0x00362AE0, 0x00362AE0 + 36052,  "game_input"),
-}
+
+def va_to_file_offset(va: int) -> int | None:
+    """Convert a virtual address using the active target's exact section map."""
+    return require_target().virtual_to_file_offset(va)
+
+
+def is_code_address(va: int) -> bool:
+    """Return whether an address belongs to approved target code."""
+    return require_target().is_code_address(va)
+
+
+def is_data_address(va: int) -> bool:
+    """Return whether an address belongs to approved target data."""
+    return require_target().is_data_address(va)
+
+
+def code_sections() -> tuple[SectionProfile, ...]:
+    """Return all approved code sections for the active target."""
+    return require_target().code_sections
+
+
+def data_sections() -> tuple[SectionProfile, ...]:
+    """Return all approved data sections for the active target."""
+    return require_target().data_sections
 
 # ============================================================
 # CRT Byte Signatures
@@ -251,31 +282,6 @@ RW_CATEGORIES = {
 # Game Sub-classification Keywords
 # ============================================================
 
-GAME_SUBCATEGORIES = {
-    "vehicle":  ["vehicle", "car ", "wheel", "engine", "gear", "throttle", "brake",
-                 "steer", "turbo", "boost", "rpm", "speed", "crash", "takedown",
-                 "jolt", "wreck", "drift"],
-    "audio":    ["sound", "audio", "music", "sfx", "voice", "wma", "dsp",
-                 "volume", "pitch", "reverb", "impulse", "speaker", "channel"],
-    "camera":   ["camera", "cam_", "look back", "bumper", "follow"],
-    "physics":  ["collid", "collisi", "physics", "rigid", "force", "velocity",
-                 "mass", "angular", "gravity", "friction", "momentum"],
-    "ui":       ["menu", "hud", "font", "screen", "button", "press", "select",
-                 "gamertag", "profile"],
-    "network":  ["online", "xbox live", "session", "host", "join", "rank",
-                 "sign in", "sign out", "matchmak"],
-    "io":       ["save", "load", "partition", "device\\", "\\tdata", "content",
-                 "savemeta", "saveimage"],
-    "render":   ["render", "draw", "shader", "vertex", "texture", "material",
-                 "d3d", "pixel"],
-    "debug":    ["assert", "error", "warning", "debug"],
-}
-
-# ============================================================
-# Default Paths
-# ============================================================
-
-DEFAULT_FUNCTIONS_JSON = "tools/disasm/output/functions.json"
-DEFAULT_STRINGS_JSON = "tools/disasm/output/strings.json"
-DEFAULT_XREFS_JSON = "tools/disasm/output/xrefs.json"
-DEFAULT_OUTPUT_DIR = "tools/func_id/output"
+# Populated from the selected target profile. Analysis-only profiles leave
+# this empty rather than inheriting Burnout-specific vocabulary.
+GAME_SUBCATEGORIES = {}

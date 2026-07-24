@@ -152,35 +152,14 @@ def _parse_hex(s: str) -> int:
     return int(s, 16)
 
 
-def _find_analysis_json(xbe_path: Path) -> Optional[Path]:
-    """Auto-detect the analysis JSON file location.
-
-    Matches any ``*_analysis.json`` written by ``tools.xbe_parser --json``,
-    so the name is per-game rather than hardcoded to one title.
-    """
-    search_dirs = [
-        # Same directory as XBE
-        xbe_path.parent,
-        # In the xbe_parser tool directory
-        Path("tools/xbe_parser"),
-        # Relative to repo root
-        xbe_path.parent.parent / "tools" / "xbe_parser",
-    ]
-    for d in search_dirs:
-        # sorted() so the pick is deterministic when a dir holds several
-        for p in sorted(d.glob("*_analysis.json")):
-            return p
-    return None
-
-
-def load_image(xbe_path: str, analysis_json: Optional[str] = None) -> BinaryImage:
+def load_image(xbe_path: str, analysis_json: str) -> BinaryImage:
     """
     Load an XBE binary and its analysis metadata.
 
     Args:
         xbe_path: Path to the .xbe file.
-        analysis_json: Optional path to burnout3_analysis.json.
-                       If None, auto-detected from standard locations.
+        analysis_json: Explicit path to parser-generated analysis JSON for the
+            exact target. Automatic discovery is intentionally unsupported.
 
     Returns:
         A fully initialized BinaryImage instance.
@@ -197,11 +176,11 @@ def load_image(xbe_path: str, analysis_json: Optional[str] = None) -> BinaryImag
         raise ValueError(f"Invalid XBE magic: {raw_data[:4]!r}")
 
     # Find and load analysis JSON
-    json_path = Path(analysis_json) if analysis_json else _find_analysis_json(xbe_file)
-    if json_path is None or not json_path.exists():
+    json_path = Path(analysis_json)
+    if not json_path.is_file():
         raise FileNotFoundError(
-            f"Analysis JSON not found. Run the XBE parser first, or specify "
-            f"--analysis-json path. Searched near: {xbe_file}"
+            f"Analysis JSON not found: {json_path}. Run the XBE parser for the "
+            "exact target and pass its path explicitly."
         )
 
     with open(json_path) as f:

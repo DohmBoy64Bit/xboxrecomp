@@ -246,15 +246,19 @@ Functions below 0.50 confidence are marked as "tentative" and should be manually
 ## Invocation
 
 ```bash
-py -3 -m tools.func_id "path/to/default.xbe" -v
+py -3 -m tools.func_id "path/to/default.xbe" \
+  --analysis-json analysis/target_analysis.json \
+  --target-profile targets/my-game.json \
+  --functions analysis/disasm/functions.json \
+  --strings analysis/disasm/strings.json \
+  --xrefs analysis/disasm/xrefs.json \
+  --output analysis/func-id -v
 ```
 
-Options:
-- `-v` / `--verbose`: print progress and per-function decisions
-- `--sig-db <path>`: path to custom signature database
-- `--xdk-version <ver>`: override XDK version detection (uses embedded library versions by default)
-- `--output <path>`: output file path (default: `identified_functions.json`)
-- `--min-confidence <float>`: minimum confidence to include in output (default: 0.3)
+The database paths and output directory are required. Every function range must
+fit one approved profile code section. RenderWare naming is disabled unless the
+selected profile explicitly enables it, and title-specific keywords belong in the
+profile rather than a global configuration module.
 
 ## Practical Tips
 

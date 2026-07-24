@@ -3,15 +3,16 @@
 #
 # Steps:
 #   1. (re)build the flat raw image from the XBE via extract_for_ghidra.py
-#   2. import the flat image into a Ghidra project as raw x86:LE:32 @ 0x10000
+#   2. import the flat image at the exact XBE base recorded in sections.json
 #   3. run auto-analysis (FunctionID/FidDb + RTTI + decompiler analyzers on)
 #   4. run ExportXbeNames.py post-script to dump functions/symbols JSON
 #      (and optionally decompiled C)
 #
 # Usage:
-#   tools/ghidra_naming/run_ghidra.sh                 # analyze + export funcs/symbols
-#   tools/ghidra_naming/run_ghidra.sh decompile 4000  # also decompile up to 4000
-#   tools/ghidra_naming/run_ghidra.sh decompile all   # decompile everything (slow)
+#   XBE=/path/default.xbe GHIDRA_OUT=/path/analysis/ghidra \
+#     tools/ghidra_naming/run_ghidra.sh
+#   XBE=/path/default.xbe GHIDRA_OUT=/path/analysis/ghidra \
+#     tools/ghidra_naming/run_ghidra.sh decompile 4000
 #
 # Re-runs: if the Ghidra project already contains the imported program, pass
 #   IMPORT=0 to skip re-import and only re-run analysis/export, or
@@ -20,6 +21,7 @@
 # Env overrides:
 #   GHIDRA_HOME  (default: /c/tools/ghidra/ghidra_12.0.3_PUBLIC)
 #   XBE          (REQUIRED: path to the Xbox default.xbe to analyze)
+#   GHIDRA_OUT   (REQUIRED: target-specific work/export root)
 #   IMPORT=0     skip import step (program already in project)
 #   ANALYZE=0    skip analysis (-noanalysis); just (re)run export post-script
 
@@ -31,13 +33,15 @@ REPO="$(cd "$HERE/../.." && pwd)"
 GHIDRA_HOME="${GHIDRA_HOME:-/c/tools/ghidra/ghidra_12.0.3_PUBLIC}"
 HEADLESS="$GHIDRA_HOME/support/analyzeHeadless.bat"
 XBE="${XBE:?ERROR: set XBE=/path/to/Xbox/default.xbe (the XBE to analyze)}"
+GHIDRA_OUT="${GHIDRA_OUT:?ERROR: set GHIDRA_OUT=/target-specific/analysis/ghidra}"
 
-WORK="$HERE/work"
-PROJ_DIR="$WORK/ghidra_project"
-PROJ_NAME="$(basename "$(dirname "$XBE")" 2>/dev/null)"
-case "$PROJ_NAME" in ""|"."|"/") PROJ_NAME="xbe";; esac
-EXPORT_DIR="$HERE/export"
+WORK="$GHIDRA_OUT/work"
+PROJ_DIR="$GHIDRA_OUT/project"
+PROJ_NAME="$(basename "$GHIDRA_OUT" 2>/dev/null)"
+case "$PROJ_NAME" in ""|"."|"/") echo "ERROR: GHIDRA_OUT must have a target-specific basename" >&2; exit 1;; esac
+EXPORT_DIR="$GHIDRA_OUT/export"
 FLAT="$WORK/xbe_flat.bin"
+SECTIONS_JSON="$WORK/sections.json"
 SCRIPT_DIR="$HERE/ghidra_scripts"
 PROG_NAME="xbe_flat.bin"   # name inside the Ghidra project
 
@@ -52,6 +56,7 @@ echo " Xbox XBE Ghidra naming pipeline"
 echo "=============================================================="
 echo " GHIDRA_HOME : $GHIDRA_HOME"
 echo " XBE         : $XBE"
+echo " Target root : $GHIDRA_OUT"
 echo " Work dir    : $WORK"
 echo " Export dir  : $EXPORT_DIR"
 echo " Decompile   : $DO_DECOMPILE (limit=$DECOMP_LIMIT timeout=${DECOMP_TIMEOUT}s)"
@@ -69,6 +74,12 @@ fi
 # Step 1: build flat image (idempotent)
 echo "[1/3] Building flat image from XBE ..."
 py -3 "$HERE/extract_for_ghidra.py" "$XBE" --out-dir "$WORK"
+IMAGE_BASE="$(py -3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["base_address"])' "$SECTIONS_JSON")"
+case "$IMAGE_BASE" in
+  0x[0-9A-Fa-f]*) ;;
+  *) echo "ERROR: invalid base_address in $SECTIONS_JSON: $IMAGE_BASE" >&2; exit 1;;
+esac
+echo "      Exact XBE image base: $IMAGE_BASE"
 
 # Convert paths to Windows form for the .bat (analyzeHeadless is a Windows batch).
 to_win() { cygpath -w "$1" 2>/dev/null || echo "$1"; }
@@ -94,7 +105,7 @@ if [ "$IMPORT" = "1" ]; then
   "$HEADLESS" "$W_PROJ_DIR" "$PROJ_NAME" \
     -import "$W_FLAT" \
     -loader BinaryLoader \
-    -loader-baseAddr 0x10000 \
+    -loader-baseAddr "$IMAGE_BASE" \
     -processor "x86:LE:32:default" \
     -cspec windows \
     -overwrite \

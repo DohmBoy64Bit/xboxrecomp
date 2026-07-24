@@ -1,303 +1,137 @@
 # Memory Layout Reproduction
 
-How to map Xbox memory at its original virtual addresses on Windows so that recompiled code with hardcoded addresses works unmodified.
+Xbox code uses 32-bit absolute virtual addresses. The shared runtime must preserve
+those addresses without embedding any one title's `.text`, `.rdata`, `.data`,
+stack, heap, TLS, or kernel-data locations.
 
-## The Problem
+## Xbox RAM and address translation
 
-Xbox games are compiled with hardcoded absolute addresses. The Burnout 3 binary contains thousands of instructions like:
+The console has 64 MB of unified RAM. The runtime creates one page-file-backed
+64 MB object and maps a base view plus mirror views at 64 MB intervals. Every
+view aliases the same pages, so a write through a mirrored Xbox address is visible
+through the base view.
 
-```asm
-mov eax, [0x004D532C]    ; read global variable
-cmp dword ptr [0x4A1C74], 0  ; check button state
-mov [0x5FFD08], ecx       ; write boost meter
-```
-
-After recompilation to C, these become:
-
-```c
-eax = MEM32(0x004D532C);
-if (CMP_EQ(MEM32(0x4A1C74), 0)) goto loc_xyz;
-MEM32(0x5FFD08) = ecx;
-```
-
-For this to work, reading address 0x004D532C must return the actual game data that was originally at that address. The entire Xbox memory map must be reproduced at the correct virtual addresses.
-
-## Xbox Memory Map
-
-The Xbox has 64 MB of unified RAM shared between CPU and GPU. Key regions:
-
-| Address Range | Content | Size |
-|---------------|---------|------|
-| 0x00000000-0x000000FF | KPCR / TIB (thread info block) | 256 B |
-| 0x00010000-0x00010FFF | XBE image header | 4 KB |
-| 0x00011000-0x002CCFFF | .text (game code) | 2.73 MB |
-| 0x002CC200-0x0036B7BF | XDK library code (D3D, DSOUND, XMV, etc.) | ~600 KB |
-| 0x0036B7C0-0x003B2354 | .rdata (constants, strings, vtables) | 280 KB |
-| 0x003B2360-0x0076EFFF | .data + BSS (globals, zero-initialized data) | 3.9 MB |
-| 0x00780000-0x00F7FFFF | Stack (8 MB, grows downward) | 8 MB |
-| 0x00F80000-0x03FFFFFF | Dynamic heap (bump allocator) | ~49 MB |
-| 0x80010000+ | Xbox kernel PE header (fake, 1 page) | 4 KB |
-| 0xFD000000+ | NV2A GPU registers (on-demand allocation) | Variable |
-| 0xFE000000+ | Kernel function thunks (synthetic VAs) | ~600 B |
-
-Total mapped: 64 MB contiguous at the base, plus special regions.
-
-## Why CreateFileMapping, Not VirtualAlloc
-
-The Xbox memory controller uses a 26-bit address bus. All addresses wrap modulo 64 MB:
-
-```
-Address 0x04070000 == Address 0x00070000  (both access same physical byte)
-Address 0x20000448 == Address 0x00000448
-```
-
-The RenderWare engine exploits this. Its memory walker crosses 64 MB and reads mirrored data for an extended walk covering 256+ MB of virtual addresses. Game initialization code also writes large data structures past 64 MB that on real hardware wrap into physical RAM.
-
-**VirtualAlloc cannot do this.** VirtualAlloc gives you distinct physical pages at each virtual address. Writing to 0x04070000 does NOT update the data at 0x00070000. We wasted days debugging this before switching to file mappings.
-
-**CreateFileMapping + MapViewOfFileEx** creates true aliases. Multiple virtual address ranges can map to the same physical pages:
+The host may not grant Xbox VA zero as the native mapping base. Recompiled memory
+access therefore uses a runtime offset:
 
 ```c
-// Create a page-file-backed mapping for 64 MB
-HANDLE mapping = CreateFileMappingA(
-    INVALID_HANDLE_VALUE,  // page file backed
-    NULL,                  // default security
-    PAGE_READWRITE,
-    0, 64 * 1024 * 1024,  // 64 MB
-    NULL                   // unnamed
-);
-
-// Map the base view at the desired Xbox address
-void *base = MapViewOfFileEx(
-    mapping,
-    FILE_MAP_ALL_ACCESS,
-    0, 0,
-    64 * 1024 * 1024,
-    (LPVOID)0x00000000     // desired base address
-);
-
-// Map mirror views at 64 MB intervals
-for (int m = 0; m < 28; m++) {
-    uintptr_t mirror_addr = (uintptr_t)base + (m + 1) * 64 * 1024 * 1024;
-    void *mirror = MapViewOfFileEx(
-        mapping,
-        FILE_MAP_ALL_ACCESS,
-        0, 0,
-        64 * 1024 * 1024,
-        (LPVOID)mirror_addr
-    );
-    // Now writes to mirror_addr + X are visible at base + X
-}
+#define XBOX_PTR(address) \
+    ((uintptr_t)(uint32_t)(address) + g_xbox_mem_offset)
+#define MEM8(address)  (*(volatile uint8_t  *)XBOX_PTR(address))
+#define MEM16(address) (*(volatile uint16_t *)XBOX_PTR(address))
+#define MEM32(address) (*(volatile uint32_t *)XBOX_PTR(address))
 ```
 
-With 28 mirror views covering 1.75 GB of address space, the RenderWare memory walker can traverse the full range it expects.
+The `uint32_t` conversion is required because original Xbox arithmetic wraps at
+32 bits before conversion to the host pointer width.
 
-## Address Translation: The XBOX_PTR Macro
+## Exact-XBE section loading
 
-All memory access goes through a single macro:
+`xbox_MemoryLayoutInit()` validates the XBE magic, image range, header size,
+section table, every section virtual range, and every raw range. It then:
+
+1. copies the XBE image header to its Xbox base address;
+2. zeroes each section's complete virtual size;
+3. copies the bounded initialized bytes from the XBE;
+4. retains original executable bytes for game-side scanners and pointer tables;
+5. rejects malformed ranges instead of skipping them silently.
+
+No shared header contains title-specific section constants. The parser JSON and
+target profile provide build-time identity; the runtime independently parses the
+exact loaded XBE.
+
+## Runtime-owned ranges
+
+The XBE header and every section are treated as occupied Xbox VA ranges. The
+initializer sorts and merges them, then searches all remaining 64 MB gaps for the
+largest candidate that can hold:
+
+- a 4 KB kernel-data export area;
+- an 8 MB simulated stack; and
+- at least a 4 MB runtime heap.
+
+The selected addresses are exposed only after successful initialization:
 
 ```c
-#define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
-
-#define MEM8(addr)   (*(volatile uint8_t  *)XBOX_PTR(addr))
-#define MEM16(addr)  (*(volatile uint16_t *)XBOX_PTR(addr))
-#define MEM32(addr)  (*(volatile uint32_t *)XBOX_PTR(addr))
-#define MEMF(addr)   (*(volatile float    *)XBOX_PTR(addr))
+XBOX_KERNEL_DATA_BASE
+XBOX_STACK_BASE
+XBOX_STACK_TOP
+XBOX_HEAP_BASE
+XBOX_HEAP_SIZE
 ```
 
-### Why the uint32_t Cast is Essential
+If no verified gap can satisfy the requirements, initialization fails. It never
+falls back to a Burnout 3, Dashboard, or other reference-title address.
 
-The `(uint32_t)` cast in XBOX_PTR is critical. On a 64-bit Windows build, `uintptr_t` is 64 bits. Without the cast:
+## Kernel thunk and kernel version identity
 
-```c
-// WRONG: if addr is the result of (0xFFFFFFFF + 1), it becomes 0x100000000
-// on 64-bit, this is 4 GB past our mapping -> access violation
-#define XBOX_PTR_BAD(addr) ((uintptr_t)(addr) + g_xbox_mem_offset)
+The entry-point encoding determines whether retail or debug XOR keys apply. The
+runtime decodes the corresponding kernel-thunk address, checks that it is aligned
+and inside Xbox RAM, then validates a zero-terminated sequence of
+`0x80000000 | ordinal` entries. The bridge refuses to initialize without this
+exact target table.
+
+The emulated kernel version is populated from the XBE's kernel library-version
+entry when present. A reference title's XDK build is not used as a default.
+
+## Low-memory thread state
+
+The lifter models `fs:[offset]` accesses as low Xbox memory. The runtime initializes
+only shared fields:
+
+```text
+fs:[0x00]  end of SEH chain
+fs:[0x04]  runtime-selected stack top
+fs:[0x08]  runtime-selected stack base
+fs:[0x18]  self pointer for the emulated low-memory TIB
+fs:[0x20]  neutral KPCR/Prcb placeholder
+fs:[0x28]  target-specific context, zero by default
 ```
 
-Xbox addresses are 32-bit and arithmetic in recompiled code can overflow. The uint32_t cast truncates to 32 bits first, matching Xbox hardware behavior where addresses wrap at 4 GB:
+A project may call `xbox_MemoryLayoutSetFs28Context()` only after static or runtime
+evidence identifies the correct context VA for the exact binary. The shared
+runtime does not create a fake RenderWare context in a reference title's BSS.
 
-```c
-// CORRECT: overflow wraps to 32 bits, then extends to 64-bit for the add
-#define XBOX_PTR(addr) ((uintptr_t)(uint32_t)(addr) + g_xbox_mem_offset)
-```
+## Heap behavior
 
-### The Memory Offset
+The current heap is a zero-filling bump allocator over the selected free range.
+It returns Xbox VAs, not native pointers. `xbox_HeapFree()` remains a no-op, so
+long-running or allocation-heavy targets must validate whether that behavior is
+sufficient before claiming parity.
 
-When the mapping lands at the original Xbox address (0x00000000), `g_xbox_mem_offset` is 0 and the MEM macros are identity casts. When Windows cannot map at the preferred address (common on Windows 11 where low addresses are reserved), the offset adjusts all accesses:
+## Fixed platform ranges
 
-```c
-// Set once during init, then read-only
-ptrdiff_t g_xbox_mem_offset = (uintptr_t)actual_base - XBOX_MAP_START;
-```
+Some addresses are platform or runtime architecture, not target configuration:
 
-The implementation tries multiple base addresses in order of preference:
+- Xbox RAM size and 64 MB mirror behavior;
+- the Xbox image base convention at `0x00010000`;
+- NV2A/PAPU hardware register ranges;
+- the fake Xbox kernel PE page used by code that probes kernel headers;
+- the synthetic kernel-dispatch range beginning at `0xFE000000`.
 
-```c
-static const uintptr_t try_bases[] = {
-    0x00010000,  // Original Xbox address (ideal)
-    0x00800000,  // 8 MB - above typical PEB/TEB
-    0x01000000,  // 16 MB
-    0x02000000,  // 32 MB
-    0x10000000,  // 256 MB
-    0,           // Let OS choose (last resort)
-};
-```
+Do not move these into a title profile merely because they are hexadecimal values.
+Conversely, do not treat a game global or linked-library section as fixed because
+it appeared in a reference project.
 
-## Section Initialization
+## Protection policy
 
-After mapping the 64 MB region, the XBE file's sections are copied to their original addresses:
+The runtime does not independently protect each XBE section. Adjacent sections may
+share a host page, so applying read-only protection to one range can accidentally
+protect bytes belonging to a writable neighbor. A future protection plan must be
+derived page-by-page from the complete target section table.
 
-```c
-// Copy XBE header (kernel thunk table, certificate, section info)
-memcpy(XBOX_VA(0x00010000), xbe_data, header_size);
+## Validation checklist
 
-// Copy .text (code bytes -- needed for RW memory walker)
-memcpy(XBOX_VA(0x00011000), xbe + 0x00001000, 2863616);
+Before runtime bring-up, verify:
 
-// Copy .rdata (constants, strings, vtables)
-memcpy(XBOX_VA(0x0036B7C0), xbe + 0x0035C000, 289684);
+- the target profile, parser JSON, and exact XBE agree;
+- every loaded section matches the parser coordinates and raw bounds;
+- runtime ranges overlap neither the header nor a section;
+- the target thunk table was decoded and registered;
+- `XBOX_STACK_TOP` and heap bounds are nonzero only after initialization;
+- mirror writes are visible through the base view;
+- target-specific `fs:[0x28]` state is documented or remains zero;
+- shared runtime changes are regression-tested against every available target.
 
-// Copy initialized .data
-memcpy(XBOX_VA(0x003B2360), xbe + 0x003A3000, 424960);
-
-// BSS is already zeroed by the file mapping
-```
-
-Additional XDK library sections are also copied (XMV, DSOUND, WMADEC, XONLINE, XNET, D3D, XGRPH, XPP, DOLBY, XON_RD, .data1).
-
-## Gotchas
-
-### .rdata Is Not Write-Protected
-
-You would expect .rdata (read-only data) to be protected:
-
-```c
-VirtualProtect(XBOX_VA(0x0036B7C0), 289684, PAGE_READONLY, &old_protect);
-```
-
-**Do not do this.** The .rdata end (0x003B2454) and .data start (0x003B2360) share the same 4KB page (0x003B2000-0x003B2FFF). VirtualProtect rounds to page boundaries, so making .rdata read-only also makes the first ~0xCA0 bytes of .data read-only. Game initialization code writes to globals in that overlap range and faults.
-
-Additionally, the game writes to .rdata at runtime. String pointers in .rdata get overwritten during resource loading. This is technically a bug in the original game, but it works on Xbox because .rdata is not actually protected in the Xbox kernel's memory model.
-
-### .rdata String Corruption
-
-Because the game writes to .rdata at runtime, string data gets corrupted. Functions that read filenames from .rdata must read from the original XBE file data instead:
-
-```c
-// WRONG: reads from potentially-corrupted .rdata in mapped memory
-const char *name = (const char *)XBOX_PTR(name_va);
-
-// CORRECT: reads from pristine XBE file copy
-extern const uint8_t *g_xbe_data;
-size_t file_offset = (name_va - 0x36B7C0) + 0x35C000;
-const char *name = (const char *)(g_xbe_data + file_offset);
-```
-
-### BSS Mirror Addresses Fail
-
-Some BSS addresses (around 0x76000000) would need mirror views at addresses that Windows 11 reserves for system use. About 4 out of 33 mirror views fail to map. This is acceptable -- the game only accesses those addresses through the base view, and the RenderWare walker handles missing mirrors gracefully.
-
-### Fake Thread Information Block
-
-The recompiler drops the `fs:` segment prefix from memory accesses like `mov eax, fs:[0x28]`. These become `MEM32(0x28)`, reading from low memory. A fake TIB is populated at address 0x0:
-
-```c
-MEM32(0x00) = 0xFFFFFFFF;      // SEH: end of chain
-MEM32(0x04) = XBOX_STACK_TOP;  // Stack base (high address)
-MEM32(0x08) = XBOX_STACK_BASE; // Stack limit (low address)
-MEM32(0x18) = 0x00000000;      // Self pointer
-MEM32(0x20) = 0x00000000;      // KPCR Prcb pointer
-MEM32(0x28) = FAKE_TLS_VA;     // TLS / RW engine context
-```
-
-The RenderWare engine reads `[fs:[0x28] + 0x28]` to find its per-thread data area. A fake structure chain is set up in BSS memory.
-
-### Xbox Kernel PE Header
-
-RenderWare's cache initialization code reads `MEM32(0x8001003C)` to parse the Xbox kernel's PE header and find the INIT section for CPU cache line sizing. A fake PE header with 0 sections is allocated at 0x80010000 so the function gracefully skips:
-
-```c
-void *kernel_page = VirtualAlloc((LPVOID)0x80010000, 4096,
-                                  MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-memset(kernel_page, 0, 4096);
-*(uint32_t *)((uint8_t *)kernel_page + 0x3C) = 0x80;  // e_lfanew
-// NumberOfSections = 0, so the INIT section search finds nothing
-```
-
-## Dynamic Heap: Bump Allocator
-
-The Xbox heap serves allocations from `MmAllocateContiguousMemory` and similar kernel functions. A simple bump allocator works because Xbox games rarely free memory:
-
-```c
-static uint32_t g_heap_next = XBOX_HEAP_BASE;  // 0x00880000
-
-uint32_t xbox_HeapAlloc(uint32_t size, uint32_t alignment) {
-    if (size < 4096) size = 4096;  // minimum to prevent overlapping zero-size allocs
-
-    uint32_t result = (g_heap_next + alignment - 1) & ~(alignment - 1);
-
-    if (result + size > XBOX_HEAP_BASE + XBOX_HEAP_SIZE)
-        return 0;  // out of memory
-
-    g_heap_next = result + size;
-    memset((void *)((uintptr_t)result + g_memory_offset), 0, size);
-    return result;  // returns Xbox VA, not native pointer
-}
-
-void xbox_HeapFree(uint32_t xbox_va) {
-    (void)xbox_va;  // no-op
-}
-```
-
-The minimum allocation size of 4096 bytes prevents a subtle bug: Xbox D3D8 code sometimes computes resource sizes from GPU capabilities that return 0 (no real NV2A hardware), causing zero-size allocations that all return the same address and overlap.
-
-## NV2A GPU Registers
-
-The Xbox GPU (NV2A) has memory-mapped registers at 0xFD000000+. Game code and XDK library code read/write these registers directly. On Windows, these addresses are not mapped by default.
-
-A Vectored Exception Handler (VEH) intercepts access violations in this range and allocates pages on demand:
-
-```c
-LONG WINAPI nv2a_veh_handler(EXCEPTION_POINTERS *info) {
-    if (info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
-        return EXCEPTION_CONTINUE_SEARCH;
-
-    uintptr_t fault_addr = info->ExceptionRecord->ExceptionInformation[1];
-    if (fault_addr >= 0xFD000000 && fault_addr < 0xFF000000) {
-        // Allocate a page at the faulting address
-        uintptr_t page = fault_addr & ~0xFFF;
-        VirtualAlloc((LPVOID)page, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-```
-
-The allocated pages are zeroed, so GPU register reads return 0 (safe defaults). NV2A functions that spin-wait on register values must be stubbed entirely -- allocating the page only prevents the crash; the spin-wait still loops forever on a zero value.
-
-## Memory Layout Summary
-
-```
-0x00000000  ┌──────────────────────┐
-            │ Fake TIB / KPCR      │  256 bytes
-0x00010000  ├──────────────────────┤
-            │ XBE Image Header     │  4 KB
-0x00011000  ├──────────────────────┤
-            │ .text (game code)    │  2.73 MB
-0x002CC200  ├──────────────────────┤
-            │ XDK library sections │  ~600 KB
-0x0036B7C0  ├──────────────────────┤
-            │ .rdata (constants)   │  280 KB
-0x003B2360  ├──────────────────────┤
-            │ .data + BSS          │  3.9 MB
-0x00780000  ├──────────────────────┤
-            │ Stack (8 MB)         │  g_esp starts at top
-0x00F80000  ├──────────────────────┤
-            │ Dynamic Heap         │  ~49 MB (bump allocator)
-0x03FFFFFF  └──────────────────────┘  End of 64 MB region
-            │ ... 28 mirror views  │  Each 64 MB, aliased to base
-0x80010000  │ Fake kernel PE hdr   │  1 page
-0xFD000000  │ NV2A GPU registers   │  On-demand VEH allocation
-0xFE000000  │ Kernel thunks        │  Synthetic VAs for 147 imports
-```
+See [Target Profiles](target-profiles.md) and
+[Building the Runtime](../pipeline/05-runtime.md).

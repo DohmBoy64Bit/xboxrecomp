@@ -6,92 +6,44 @@ The lifted C code from Step 4 is just one piece of the puzzle. It expects to run
 
 The runtime has four major subsystems:
 1. **Memory Layout** -- map Xbox virtual addresses into Windows process space
-2. **Kernel Shim** -- replace 147+ Xbox kernel functions with Win32 equivalents
+2. **Kernel Shim** -- resolve the current title's ordinal thunk slots
 3. **D3D8-to-D3D11 Bridge** -- translate Direct3D 8 calls to modern Direct3D 11
 4. **Input** -- map Xbox controller input to XInput
 
 ## Memory Layout
 
-### The Problem
+Xbox code uses absolute virtual addresses, so the runtime creates one 64 MB
+page-file-backed RAM object and maps a base view plus aliased 64 MB mirror views.
+The host base may differ from Xbox VA zero; `g_xbox_mem_offset` translates every
+`MEM*` access while preserving true mirror aliases.
 
-Xbox games use hardcoded absolute addresses for all global variables. When the original code does `mov eax, [0x004D532C]`, it expects a specific variable at that exact address. On Windows, address space layout randomization (ASLR) and existing allocations mean address `0x004D532C` is not available by default.
+The exact XBE drives section loading. `xbox_MemoryLayoutInit()` validates the
+header and section table, zeroes each virtual section, copies its bounded raw
+bytes, and retains original code bytes for scanners and pointer tables. No
+`.text`, `.rdata`, `.data`, or XDK section address is compiled into the shared
+runtime.
 
-### The Solution: CreateFileMapping + MapViewOfFileEx
+Runtime-owned data also cannot use reference-title addresses. The initializer
+sorts the XBE header and every section as occupied ranges, then selects a verified
+free RAM gap large enough for:
 
-The runtime creates a file mapping object backed by the page file and maps views of it at the exact Xbox virtual addresses:
+1. the 4 KB kernel-data export area;
+2. the 8 MB simulated stack; and
+3. a minimum 4 MB runtime heap.
 
-```c
-// Create a 64 MB file mapping (Xbox total RAM)
-HANDLE hMapping = CreateFileMapping(
-    INVALID_HANDLE_VALUE,   // page file backed
-    NULL,                   // default security
-    PAGE_READWRITE,         // read-write access
-    0, 64 * 1024 * 1024,   // 64 MB
-    NULL                    // unnamed
-);
+Initialization fails if no such gap exists. `XBOX_KERNEL_DATA_BASE`,
+`XBOX_STACK_BASE`, `XBOX_STACK_TOP`, `XBOX_HEAP_BASE`, and `XBOX_HEAP_SIZE` are
+runtime-selected values valid only after successful initialization.
 
-// Map the base view at address 0x00000000
-void *base = MapViewOfFileEx(
-    hMapping,
-    FILE_MAP_ALL_ACCESS,
-    0, 0,                   // offset 0
-    64 * 1024 * 1024,       // 64 MB
-    (void*)0x00000000       // requested base address
-);
-```
+The kernel-thunk address is decoded from the exact retail or debug XBE header and
+validated as a zero-terminated ordinal table. The shared runtime has no Burnout 3
+fallback. Target-specific `fs:[0x28]` state defaults to zero and may be set only
+through `xbox_MemoryLayoutSetFs28Context()` after evidence identifies the correct
+VA.
 
-### Why Not VirtualAlloc?
-
-An earlier approach used `VirtualAlloc` to reserve memory at the target addresses. This works for the basic case, but fails for **memory mirrors**. The Xbox has 64 MB of physical RAM that is identity-mapped, but some games access it through mirrored addresses (e.g., `0x80000000 + offset` is the same physical memory as `0x00000000 + offset`).
-
-With `VirtualAlloc`, two allocations at different addresses are completely independent -- writing to one does not affect the other. With `CreateFileMapping`, two `MapViewOfFileEx` calls on the same mapping object create true aliases: writes to one view are instantly visible through the other, because they share the same physical pages.
-
-### Mirror Views
-
-The Xbox maps its 64 MB of RAM at multiple address ranges. The runtime pre-maps 28 mirror views:
-
-```c
-#define XBOX_NUM_MIRRORS 28
-
-for (int i = 1; i <= XBOX_NUM_MIRRORS; i++) {
-    uintptr_t mirror_addr = (uintptr_t)i * 64 * 1024 * 1024;
-    g_mirror_views[i-1] = MapViewOfFileEx(
-        hMapping,
-        FILE_MAP_ALL_ACCESS,
-        0, 0,
-        64 * 1024 * 1024,
-        (void*)mirror_addr
-    );
-    // Some mirrors will fail (address already in use) -- that's OK
-}
-```
-
-Not all mirrors succeed -- Windows may have DLLs or other allocations at some addresses. For Burnout 3, 4 out of 33 attempted mirrors fail due to address conflicts. This is acceptable because the game primarily accesses RAM through the base view.
-
-### Section Loading
-
-After mapping, the runtime copies XBE section data to the correct addresses:
-
-```c
-// Copy .rdata (read-only data: strings, vtables, constants)
-memcpy((void*)XBOX_RDATA_VA, xbe_data + RDATA_RAW_OFFSET, XBOX_RDATA_SIZE);
-
-// Copy initialized .data (global variables with initial values)
-memcpy((void*)XBOX_DATA_VA, xbe_data + DATA_RAW_OFFSET, XBOX_DATA_INIT_SIZE);
-
-// Zero-fill BSS (uninitialized globals)
-memset((void*)(XBOX_DATA_VA + XBOX_DATA_INIT_SIZE), 0,
-       XBOX_DATA_SIZE - XBOX_DATA_INIT_SIZE);
-
-// Copy XDK library data sections
-for (int i = 0; i < NUM_EXTRA_SECTIONS; i++) {
-    memcpy((void*)g_extra_sections[i].va,
-           xbe_data + g_extra_sections[i].raw_offset,
-           g_extra_sections[i].size);
-}
-```
-
-The .text section is NOT copied -- the recompiled code is native Windows code in the compiled binary, not the original x86 instructions. Only data sections need to be at their original addresses.
+Read [Target Profiles](../technical/target-profiles.md) and
+[Memory Layout Reproduction](../technical/memory-layout.md) for the complete
+contract.
 
 ### NV2A GPU Registers
 
@@ -147,7 +99,7 @@ A bump allocator is sufficient because Xbox games rarely free memory -- they all
 
 ## Kernel Shim
 
-The Xbox kernel provides 366 possible exports. Games import a subset. Burnout 3 uses 147.
+The Xbox kernel is ordinal-based. The runtime supports ordinal values through 378, while each title supplies only the zero-terminated thunk slots present in its exact XBE.
 
 ### Architecture
 
@@ -169,7 +121,7 @@ Kernel thunk entries in the XBE contain ordinals (`0x80000000 | ordinal`). At in
 MEM32(thunk_table_addr + slot * 4) = KERNEL_VA_BASE + slot * 4;
 ```
 
-When `RECOMP_ICALL` encounters a VA in `[0xFE000000, 0xFE000600)`, it routes to `recomp_lookup_kernel()` which dispatches to the per-ordinal bridge function.
+When `RECOMP_ICALL` encounters a VA in the active synthetic range beginning at `0xFE000000`, it routes to `recomp_lookup_kernel()`. The range length comes from the current title's validated thunk count.
 
 ### Bridge Function Example
 
@@ -218,7 +170,7 @@ MEM32(thunk_slot_156) = KDATA_TICK_COUNT;
 MEM32(KDATA_TICK_COUNT) = GetTickCount();
 ```
 
-The kernel data area is a 4 KB block at `0x00740000` that holds all data exports.
+The kernel data area is a 4 KB runtime-selected block in a verified free RAM gap.
 
 ## D3D8-to-D3D11 Bridge
 
@@ -360,7 +312,7 @@ cmake -S . -B build
 cmake --build build --config Release
 ```
 
-The output is a single executable (`bin/burnout3.exe`) that links:
+The output is one target executable that links:
 - The auto-generated recompiled code (static library)
 - The manual overrides
 - The kernel shim (static library)
@@ -373,11 +325,11 @@ System dependencies: `d3d11.lib`, `dxgi.lib`, `d3dcompiler.lib`, `xinput.lib`, `
 
 ## Startup Sequence
 
-1. Load the XBE file from disk (keep in memory for .rdata string fallback)
-2. Call `xbox_MemoryLayoutInit()` to map sections to Xbox VAs
-3. Call `xbox_kernel_init()` to fill the kernel thunk table
-4. Call `xbox_kernel_bridge_init()` to wire synthetic VAs
-5. Initialize g_esp to XBOX_STACK_TOP
-6. Create the window and D3D11 device
-7. Call the decoded entry point function: `sub_001D2807()`
-8. Enter the Windows message loop, calling the game's frame function each tick
+1. Validate the target profile, parser JSON, and exact XBE; generate `target_profile.h`.
+2. Load the exact XBE file.
+3. Call `xbox_MemoryLayoutInit()` to validate/load sections, select runtime ranges, and register the target thunk table.
+4. Call `xbox_kernel_init()` to initialize shared ordinal implementations.
+5. Initialize file and save-path translation explicitly for the target.
+6. Call `xbox_kernel_bridge_init()` and fail if no valid target thunk table was registered.
+7. Use the runtime-selected `XBOX_STACK_TOP` and generated `XBOX_TARGET_ENTRY_POINT`.
+8. Initialize the target's graphics/input/audio surfaces and enter the declared frame path.

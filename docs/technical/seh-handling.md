@@ -4,12 +4,9 @@ Structured Exception Handling in statically recompiled Xbox code, and our own us
 
 ## Background: SEH on Xbox
 
-Xbox games are compiled with the MSVC compiler, which uses Windows Structured Exception Handling (SEH) for `__try`/`__except` blocks. The compiler emits calls to CRT helper functions:
+Xbox games are commonly compiled with the MSVC compiler, which uses Windows Structured Exception Handling (SEH) for `__try`/`__except` blocks. The compiler may emit calls to CRT frame helpers such as `__SEH_prolog` and `__SEH_epilog`. Their virtual addresses are target- and build-specific. They must be identified for the exact XBE and recorded in the selected target profile as `special_functions.seh_prolog` and `special_functions.seh_epilog`; the recompiler never falls back to reference-title addresses.
 
-- `__SEH_prolog` (VA 0x00244784): Sets up an exception frame on the stack, installs it in the TIB exception chain (fs:[0x00]), and initializes ebp for the calling function.
-- `__SEH_epilog` (VA 0x00244797): Tears down the exception frame, restores the previous handler, and cleans up ebp.
-
-In the original binary, these are standard CRT functions that manipulate the thread's exception handler chain. In recompiled code, they are translated just like any other function -- but with a critical twist.
+In the original binary, these helpers manipulate the thread's exception-handler chain. In recompiled code, they are translated like other target functions, but the generated caller and helper need an explicit bridge for `ebp`.
 
 ## The ebp Bridge Problem
 
@@ -36,8 +33,8 @@ extern uint32_t g_seh_ebp;
 The flow:
 
 ```c
-// In __SEH_prolog (sub_00244784):
-void sub_00244784(void) {
+// In the profile-identified __SEH_prolog helper:
+void sub_target_seh_prolog(void) {
     uint32_t ebp;
     // ... set up exception frame on Xbox stack ...
     ebp = esp - N;       // compute frame pointer
@@ -50,13 +47,13 @@ void sub_001234AB(void) {
     PUSH32(esp, ebp);           // push old ebp
     // push other SEH setup data...
     PUSH32(esp, 0xDEAD0000);    // dummy return address
-    sub_00244784();              // call __SEH_prolog
+    sub_target_seh_prolog();     // call profile-identified helper
     ebp = g_seh_ebp;            // READ BACK the computed ebp
 
     // ... function body using local ebp as frame pointer ...
 
     g_seh_ebp = ebp;            // write for epilog
-    sub_00244797();              // call __SEH_epilog
+    sub_target_seh_epilog();     // call profile-identified helper
     POP32(esp, ebp);            // restore old ebp
 }
 ```
@@ -152,15 +149,15 @@ In recompiled code, these vtable calls go through RECOMP_ICALL, which:
 2. Reads the function pointer from the vtable (access violation if the vtable address is unmapped).
 3. Calls the function (if the function address is garbage, dispatch fails).
 
-Problem: Step 2 can crash in native code (reading from an unmapped address), and our VEH does not handle this because it is in the [0x400000, 0xFE000000) range where we do not allocate pages.
+Problem: Step 2 can crash in native code when the vtable address is unmapped. A broad numeric range cannot distinguish target code, target data, and unmapped garbage across different games.
 
 ### Solutions
 
-**Centralized ICALL early-out** (preferred): Check the VA range before dereferencing:
+**Centralized ICALL early-out** (preferred): Check ordinary target addresses against the generated profile predicate while preserving the synthetic kernel range:
 
 ```c
-if (_va >= 0x00400000 && _va < 0xFE000000) {
-    g_esp += 4; eax = 0; break;  // garbage VA, skip
+if (_va < 0xFE000000u && !XBOX_TARGET_IS_CODE_ADDRESS(_va)) {
+    g_esp += 4; eax = 0; break;  // not approved target code
 }
 ```
 
@@ -170,8 +167,8 @@ if (_va >= 0x00400000 && _va < 0xFE000000) {
 // Before a vtable ICALL in sub_001B4170:
 uint32_t vtable = MEM32(esi);
 uint32_t method = MEM32(vtable + 0x10);
-if (method >= 0x00400000 && method < 0xFE000000) {
-    goto skip_this_call;  // corrupted vtable, skip
+if (method < 0xFE000000u && !XBOX_TARGET_IS_CODE_ADDRESS(method)) {
+    goto skip_this_call;  // not approved target code
 }
 PUSH32(esp, 0);
 RECOMP_ICALL(method);
@@ -203,7 +200,7 @@ MEM32(0x00) = pointer to top-most exception frame
 | Fake TIB at VA 0x0 | Exception chain anchor, stack bounds, TLS | Working |
 | VEH for NV2A pages | Allocate GPU register pages on demand | Working |
 | VEH for DIV0 | DO NOT DO THIS -- interferes with game's SEH | Removed |
-| ICALL range check | Skip garbage vtable pointers | Working (centralized + per-function) |
+| Profile-driven ICALL code check | Reject addresses outside approved target code sections | Working (centralized + per-function) |
 | Full SEH emulation | Wrap ICALL in __try/__except | Not implemented |
 
 The key lesson: in a static recompilation, you inherit the game's exception handling strategy but cannot use the same mechanism (real SEH on a real x86 stack). You must find alternative approaches -- VEH for hardware faults, range checks for corrupted pointers, and bridge variables for inter-function communication.

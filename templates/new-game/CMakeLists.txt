@@ -37,6 +37,35 @@ set(XBOXRECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../xboxrecomp" CACHE PATH
 # and provides the 'xboxrecomp' umbrella target to link against.
 add_subdirectory(${XBOXRECOMP_DIR} ${CMAKE_BINARY_DIR}/xboxrecomp)
 
+# ── Exact target identity ───────────────────────────────────────
+#
+# The build regenerates a C header only after the standalone profile, parser
+# analysis, and exact XBE agree. This prevents stale reference-title addresses
+# from entering the runtime executable.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(TARGET_PROFILE "${CMAKE_CURRENT_SOURCE_DIR}/target-profile.json" CACHE FILEPATH
+    "Validated per-title target profile")
+set(TARGET_ANALYSIS_JSON "${CMAKE_CURRENT_SOURCE_DIR}/analysis/target_analysis.json" CACHE FILEPATH
+    "Machine-readable output from tools.xbe_parser for the exact XBE")
+set(TARGET_XBE "${CMAKE_CURRENT_SOURCE_DIR}/game/default.xbe" CACHE FILEPATH
+    "Exact target XBE used for profile hash and section-bound validation")
+set(TARGET_PROFILE_HEADER "${CMAKE_CURRENT_BINARY_DIR}/generated/target_profile.h")
+
+add_custom_command(
+    OUTPUT ${TARGET_PROFILE_HEADER}
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    COMMAND ${Python3_EXECUTABLE} -m tools.target_profile emit-c-header
+            --profile "${TARGET_PROFILE}"
+            --analysis-json "${TARGET_ANALYSIS_JSON}"
+            --xbe "${TARGET_XBE}"
+            --output "${TARGET_PROFILE_HEADER}"
+    DEPENDS ${TARGET_PROFILE} ${TARGET_ANALYSIS_JSON} ${TARGET_XBE}
+            ${XBOXRECOMP_DIR}/tools/target_profile.py
+    WORKING_DIRECTORY ${XBOXRECOMP_DIR}
+    VERBATIM
+)
+add_custom_target(generate_target_profile_header DEPENDS ${TARGET_PROFILE_HEADER})
+
 # ── Recompiled game executable ──────────────────────────────────
 
 # Collect generated recompiled code.
@@ -62,7 +91,9 @@ set(GAME_SOURCES
 add_executable(${PROJECT_NAME} WIN32
     ${GAME_SOURCES}
     ${RECOMP_GEN_SOURCES}
+    ${TARGET_PROFILE_HEADER}
 )
+add_dependencies(${PROJECT_NAME} generate_target_profile_header)
 
 # Link against the xboxrecomp umbrella target (all 6 runtime libraries)
 target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
@@ -71,6 +102,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE xboxrecomp)
 target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/recomp
+    ${CMAKE_CURRENT_BINARY_DIR}/generated
     ${XBOXRECOMP_DIR}/include
 )
 

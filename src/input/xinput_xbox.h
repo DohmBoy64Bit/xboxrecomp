@@ -11,8 +11,8 @@
  * - Device enumeration
  */
 
-#ifndef BURNOUT3_XINPUT_XBOX_H
-#define BURNOUT3_XINPUT_XBOX_H
+#ifndef XBOXRECOMP_XINPUT_XBOX_H
+#define XBOXRECOMP_XINPUT_XBOX_H
 
 #include <stdint.h>
 #include "platform/xbox_winnt.h"
@@ -113,4 +113,4 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
 }
 #endif
 
-#endif /* BURNOUT3_XINPUT_XBOX_H */
+#endif /* XBOXRECOMP_XINPUT_XBOX_H */

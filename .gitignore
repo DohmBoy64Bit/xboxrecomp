@@ -17,6 +17,7 @@ game_files/
 # IDE
 .vscode/
 .idea/
+.serena/
 *.suo
 *.user
 

@@ -44,6 +44,9 @@
 #include <stddef.h>
 #include <string.h>
 
+/* Generated from the exact target profile by tools.target_profile. */
+#include "target_profile.h"
+
 /* MSVC's __forceinline -> gcc/clang equivalent on POSIX. */
 #if !defined(_MSC_VER) && !defined(__forceinline)
 #define __forceinline inline __attribute__((always_inline))
@@ -326,22 +329,18 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
  * The caller must PUSH32 a dummy return address before this macro.
  * If not found, pops the dummy return address to keep the stack balanced.
  *
- * The range check (0x00400000 to 0xFE000000) skips garbage VAs that
- * come from uninitialized vtable pointers. Adjust this range based
- * on your game's .text section boundaries. Kernel thunks at
- * 0xFE000000+ must NOT be blocked.
- *
- * CUSTOMIZE: Change the VA range check to match your game's code range.
- * Your .text section typically spans 0x00010000 to ~0x003XXXXX.
- * Any VA outside .text and below 0xFE000000 is likely garbage.
+ * The generated target profile supplies every approved code range. Calls below
+ * the synthetic kernel range are rejected unless they belong to one of those
+ * exact sections. This avoids title-specific hand-edited range checks while
+ * preserving kernel thunks at 0xFE000000 and above.
  */
 #define RECOMP_ICALL(xbox_va) do { \
     uint32_t _va = (uint32_t)(xbox_va); \
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
     g_icall_trace_idx++; \
     g_icall_count++; \
-    /* Skip garbage VAs outside code section + kernel thunk range */ \
-    if (_va >= 0x00400000 && _va < 0xFE000000) { \
+    /* Reject non-code target VAs while preserving synthetic kernel thunks. */ \
+    if (_va < 0xFE000000u && !XBOX_TARGET_IS_CODE_ADDRESS(_va)) { \
         g_esp += 4; eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \
@@ -364,7 +363,7 @@ recomp_func_t recomp_lookup_manual(uint32_t xbox_va);
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va; \
     g_icall_trace_idx++; \
     g_icall_count++; \
-    if (_va >= 0x00400000 && _va < 0xFE000000) { \
+    if (_va < 0xFE000000u && !XBOX_TARGET_IS_CODE_ADDRESS(_va)) { \
         g_esp = (saved_esp); eax = 0; break; \
     } \
     recomp_func_t _fn = recomp_lookup_manual(_va); \

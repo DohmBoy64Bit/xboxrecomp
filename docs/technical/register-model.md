@@ -23,7 +23,7 @@ extern uint32_t g_eax, g_ecx, g_edx, g_esp;
 | `g_eax`  | Return values, general accumulator, multiply/divide results |
 | `g_ecx`  | `this` pointer for thiscall, loop counter (REP/LOOP) |
 | `g_edx`  | High dword of 64-bit multiply/divide, general scratch |
-| `g_esp`  | Stack pointer -- points into Xbox memory, starts at 0x00F7FFF0 |
+| `g_esp`  | Stack pointer -- points into the runtime-selected Xbox stack region |
 
 ### Callee-Saved Registers
 
@@ -33,7 +33,7 @@ These registers must be preserved across function calls. In the original x86 cod
 extern uint32_t g_ebx, g_esi, g_edi;
 ```
 
-They are global (not local) because callers pass implicit parameters through them. For example, many Burnout 3 functions use `esi` as a `this` pointer in thiscall convention. The callee-save contract is enforced by the generated PUSH32/POP32 instructions, not by C scoping.
+They are global (not local) because callers pass implicit parameters through them. Many Xbox titles use `esi` or another callee-saved register as an implicit object/context pointer. The callee-save contract is enforced by the generated PUSH32/POP32 instructions, not by C scoping.
 
 A typical callee-saved prologue in generated code:
 
@@ -58,13 +58,13 @@ void sub_000636D0(void) {
 
 **ebp is NOT global.** It is declared as a local `uint32_t ebp` in every generated function.
 
-Why? Over 20,000 functions in the Burnout 3 binary use Frame Pointer Omission (FPO). With FPO, the compiler treats ebp as a general-purpose scratch register and does not save/restore it. If ebp were global, function A could set ebp to some value, call function B (which uses ebp as scratch without saving it), and when B returns, A's ebp is destroyed.
+Why? Xbox MSVC builds commonly use Frame Pointer Omission (FPO). With FPO, the compiler treats ebp as a general-purpose scratch register and does not save/restore it. If ebp were global, function A could set ebp to some value, call function B (which uses ebp as scratch without saving it), and when B returns, A's ebp would be destroyed.
 
 By making ebp local, each function gets its own copy via C's stack frame mechanism. FPO functions can use it freely without corrupting anyone else's value.
 
 ### The SEH Bridge: g_seh_ebp
 
-The one case where ebp's locality causes a problem is Structured Exception Handling (SEH). The Xbox CRT's `__SEH_prolog` function (at VA 0x00244784) sets up an exception frame and initializes ebp for the calling function. But since ebp is local, the caller cannot see the change that `__SEH_prolog` made to its local ebp.
+The one case where ebp's locality causes a problem is Structured Exception Handling (SEH). A target CRT frame helper such as `__SEH_prolog` sets up an exception frame and initializes ebp for the calling function. Its VA is build-specific and must come from the selected target profile. Since ebp is local, the caller cannot otherwise see the value computed by the helper.
 
 The solution is a bridge variable:
 
@@ -76,13 +76,13 @@ extern uint32_t g_seh_ebp;
 
 ```c
 // In the caller (generated code):
-sub_00244784();          // __SEH_prolog -- sets g_seh_ebp
+sub_target_seh_prolog(); // profile-identified helper sets g_seh_ebp
 ebp = g_seh_ebp;        // read back the value
 
 // ... function body using local ebp ...
 
-g_seh_ebp = ebp;        // write it for __SEH_epilog
-sub_00244797();          // __SEH_epilog
+g_seh_ebp = ebp;        // write it for the profile-identified epilog
+sub_target_seh_epilog();
 ```
 
 ## Register Name Aliases
@@ -120,15 +120,17 @@ void sub_00011A30(void) {
 
 ## Stack Simulation
 
-The Xbox stack lives in mapped Xbox memory. `g_esp` starts at the top of an 8 MB region:
+The Xbox stack lives in mapped Xbox memory. `g_esp` starts at the top of a runtime-selected 8 MB region that is proven not to overlap the XBE header or any loaded section:
 
 ```c
-#define XBOX_STACK_BASE  0x00780000
 #define XBOX_STACK_SIZE  (8 * 1024 * 1024)
-#define XBOX_STACK_TOP   (XBOX_STACK_BASE + XBOX_STACK_SIZE - 16)
+extern uint32_t g_xbox_stack_base;
+extern uint32_t g_xbox_stack_top;
+#define XBOX_STACK_BASE  (g_xbox_stack_base)
+#define XBOX_STACK_TOP   (g_xbox_stack_top)
 
-// During init:
-g_esp = XBOX_STACK_TOP;  // 0x00F7FFF0
+// After xbox_MemoryLayoutInit() succeeds:
+g_esp = XBOX_STACK_TOP;  // selected from an XBE-free runtime gap
 ```
 
 Push and pop operations read/write through the MEM macros, which translate Xbox virtual addresses to actual mapped memory:

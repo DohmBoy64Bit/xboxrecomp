@@ -17,7 +17,7 @@ Memory model:
 import struct
 
 from .disasm import Instruction, Operand
-from .config import is_code_address, is_data_address, va_to_file_offset, KERNEL_THUNK_ADDR
+from tools.target_profile import TargetProfile
 
 
 # ── Operand formatting ──────────────────────────────────────
@@ -643,17 +643,27 @@ def try_match_cmp_jcc(insns, idx, lifter=None):
 class Lifter:
     """Translates x86 instructions to C statements."""
 
-    def __init__(self, func_db=None, label_db=None, abi_db=None, xbe_data=None):
+    def __init__(self, func_db=None, label_db=None, abi_db=None, xbe_data=None,
+                 target_profile: TargetProfile | None = None):
         """
         func_db: dict of func_addr → func_info (for naming call targets)
         label_db: dict of addr → name (for kernel imports, etc.)
         abi_db: dict of addr → ABI info (for calling conventions)
         xbe_data: raw XBE file bytes (for reading jump tables)
+        target_profile: Explicit per-title address and special-function profile.
         """
         self.func_db = func_db or {}
         self.label_db = label_db or {}
         self.abi_db = abi_db or {}
+        if target_profile is None:
+            raise ValueError("Lifter requires an explicit target profile")
         self.xbe_data = xbe_data
+        self.target_profile = target_profile
+        self.seh_functions = frozenset(
+            address
+            for name, address in target_profile.special_functions.items()
+            if name in {"seh_prolog", "seh_epilog"}
+        )
         self._fp_top = 0  # FPU stack top index
         self.func_start = 0  # Set per-function by translator
         self.func_end = 0
@@ -1070,13 +1080,12 @@ class Lifter:
             args.append(f"0 /* a{i+1} */")
         return ", ".join(args)
 
-    # SEH prolog/epilog addresses - these functions modify ebp for their
-    # caller.  After calling __SEH_prolog, the caller must read back ebp
-    # from g_seh_ebp.  Before returning, __SEH_prolog writes g_seh_ebp.
-    SEH_PROLOG = 0x00244784  # __SEH_prolog
-    SEH_EPILOG = 0x002447BF  # __SEH_epilog
+    def is_seh_helper(self, address):
+        """Return whether an address is a profile-identified SEH frame helper."""
+        return address in self.seh_functions
 
     def _lift_call(self, insn, ops):
+        """Lift direct or indirect CALL while preserving stack and SEH state."""
         # x86 'call' pushes return address then jumps.
         # With global esp, we push a dummy return address (0) then call.
         # The callee's 'ret' will pop it back off.
@@ -1084,7 +1093,7 @@ class Lifter:
             name = self._call_target_name(insn.call_target)
             lines = [f"PUSH32(esp, 0); {name}(); /* call 0x{insn.call_target:08X} */"]
             # After __SEH_prolog/__SEH_epilog, read back the frame pointer.
-            if insn.call_target in (self.SEH_PROLOG, self.SEH_EPILOG):
+            if self.is_seh_helper(insn.call_target):
                 lines.append("ebp = g_seh_ebp; /* read back frame from SEH helper */")
             return lines
         elif len(ops) >= 1:
@@ -1094,12 +1103,13 @@ class Lifter:
         return ["/* call: no target */"]
 
     def _lift_ret(self, insn, ops):
+        """Lift RET and bridge profile-identified SEH helper frame state."""
         # x86 'ret' pops return address from stack.
         # 'ret N' also pops N extra bytes (stdcall cleanup).
         # If this function IS __SEH_prolog or __SEH_epilog, bridge ebp
         # so the caller can read back the frame pointer.
         prefix = ""
-        if self.func_start in (self.SEH_PROLOG, self.SEH_EPILOG):
+        if self.is_seh_helper(self.func_start):
             prefix = "g_seh_ebp = ebp; "
         if len(ops) >= 1 and ops[0].type == "imm":
             n = ops[0].imm
@@ -1116,7 +1126,7 @@ class Lifter:
         valid code address or max_entries is reached."""
         if not self.xbe_data:
             return []
-        offset = va_to_file_offset(table_va)
+        offset = self.target_profile.virtual_to_file_offset(table_va)
         if offset is None:
             return []
         targets = []
@@ -1125,7 +1135,7 @@ class Lifter:
             if o + 4 > len(self.xbe_data):
                 break
             val = struct.unpack_from('<I', self.xbe_data, o)[0]
-            if not is_code_address(val):
+            if not self.target_profile.is_code_address(val):
                 break
             targets.append(val)
         return targets

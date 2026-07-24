@@ -24,8 +24,8 @@
 extern IDirect3DDevice8 *xbox_GetD3DDevice(void);
 
 /* Global.txd texture lookup */
-/* Game-specific texture lookup - only available when GAME_HAS_FONT_ATLAS is defined */
-#ifdef GAME_HAS_FONT_ATLAS
+/* Burnout 3 texture fixture; excluded from the target-neutral runtime by default. */
+#ifdef XBOXRECOMP_BURNOUT3_NV2A_FIXTURES
 typedef struct { char name[24]; IDirect3DTexture8 *texture; uint32_t width, height, format; } TXD_Entry;
 typedef struct { TXD_Entry entries[512]; int count; } TXD_Dict;
 extern TXD_Dict g_global_txd;
@@ -35,8 +35,8 @@ extern IDirect3DTexture8 *txd_find(const TXD_Dict *dict, const char *name);
 static int g_textures_loaded = 0;
 #endif
 
-/* Font atlas DXT5 data - game-specific, only available in burnout3 */
-#ifdef GAME_HAS_FONT_ATLAS
+/* Captured Burnout 3 font atlas data, enabled only with the fixture option. */
+#ifdef XBOXRECOMP_BURNOUT3_NV2A_FIXTURES
 #include "font_atlas_data.h"
 #endif
 
@@ -357,9 +357,9 @@ static void submit_draw(void)
     dev->lpVtbl->SetVertexShader(dev, D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
 
     /* Bind texture based on NV2A VRAM offset.
-     * Game-specific texture mapping is handled via GAME_HAS_FONT_ATLAS
-     * compile flag. Generic path uses vertex color only. */
-#ifdef GAME_HAS_FONT_ATLAS
+     * Captured Burnout 3 texture mapping is available only through the
+     * explicit fixture option. Generic targets use vertex color only. */
+#ifdef XBOXRECOMP_BURNOUT3_NV2A_FIXTURES
     if (g_textures_loaded) {
         if (!g_pg.texture_lookup_done) {
             g_pg.texture_lookup_done = 1;

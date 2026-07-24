@@ -68,27 +68,32 @@ Emulators are great. Cxbx-Reloaded and xemu do incredible work. But static recom
               |
               v
     +-------------------+
-    |  3. Disassemble   |     Find functions, build control flow graphs
+    |  3. Target Profile|     Bind analysis to this exact XBE and annotations
+    +-------------------+     tools/target_profile.py
+              |
+              v
+    +-------------------+
+    |  4. Disassemble   |     Find candidates across approved code sections
     +-------------------+     tools/disasm/
               |
               v
     +-------------------+
-    |  4. Identify      |     Classify: CRT, RenderWare, D3D, game code
+    |  5. Identify      |     Classify with explicit target/profile inputs
     +-------------------+     tools/func_id/
               |
               v
     +-------------------+
-    |  5. Lift to C     |     Translate x86 instructions to C statements
+    |  6. Lift to C     |     Translate x86 instructions to C statements
     +-------------------+     tools/recomp/
               |
               v
     +-------------------+
-    |  6. Build Runtime  |    Kernel shim, D3D translation, memory layout
+    |  7. Build Runtime |     Exact-XBE memory, kernel, graphics, audio, input
     +-------------------+     templates/runtime/
               |
               v
     +-------------------+
-    |  7. Compile & Run  |    MSVC builds native .exe — game runs!
+    |  8. Validate      |     Compile, run, and prove declared checkpoints
     +-------------------+
 ```
 
@@ -98,7 +103,7 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 
 | Library | Source | What It Does |
 |---------|--------|-------------|
-| **xbox_kernel** | Custom | Xbox kernel → Win32 (115 of the kernel's 366 ordinals resolved, 55 with dedicated bridges: memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus) |
+| **xbox_kernel** | Custom | Xbox kernel → host compatibility: exact-title thunk validation and dispatch, memory, file I/O, threading, synchronization, crypto, HAL, EEPROM, SMBus, and other implemented/partial surfaces. Verify support per ordinal from current source and runtime behavior. |
 | **xbox_d3d8** | Custom | D3D8 → D3D11 graphics: **4-stage multi-texture** FFP pipeline, **NV2A register combiner** pixel shaders, **programmable vertex shaders** (NV2A microcode → HLSL), **hardware T&L lighting** (8 lights), **vertex fog**, DrawPrimitiveUP ring buffer, texture unswizzling, 20+ format conversions |
 | **xbox_dsound** | Custom | DirectSound → software mixer (IDirectSound8/IDirectSoundBuffer8) |
 | **xbox_apu** | xemu | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |
@@ -125,7 +130,7 @@ recomp_func_t recomp_lookup(uint32_t xbox_va);        // Auto-generated dispatch
 recomp_func_t recomp_lookup_manual(uint32_t xbox_va);  // Hand-written overrides
 ```
 
-The recompiler output (`tools/recomp`) generates these automatically. The xboxrecomp libraries handle everything else — memory layout, kernel calls, graphics, audio, and input.
+The recompiler output (`tools/recomp`) generates these automatically. The game build also generates `target_profile.h` only after the selected profile, parser JSON, and exact XBE agree. The xboxrecomp libraries then use that identity for code-range checks while the memory and kernel layers derive title layout and thunk data from the exact XBE.
 
 ### Architecture
 
@@ -179,29 +184,47 @@ cd xboxrecomp
 mkdir game_files
 # copy default.xbe and game data into game_files/
 
-# 3. Parse the XBE — learn what you're working with
-py -3 -m tools.xbe_parser game_files/default.xbe
-#    Output: section map, kernel imports, entry point, XDK version
+# 3. Parse the exact XBE and save machine-readable analysis
+py -3 -m tools.xbe_parser game_files/default.xbe --json analysis/target_analysis.json
 
-# 4. Disassemble — find all functions
-py -3 -m tools.disasm game_files/default.xbe --text-only
-#    Output: tools/disasm/output/ (functions.json, xrefs.json, strings.json)
+# 4. Generate a per-title profile bound to the exact XBE
+py -3 -m tools.target_profile generate \
+  --analysis-json analysis/target_analysis.json \
+  --xbe game_files/default.xbe \
+  --output targets/my-game.json
 
-# 5. Identify library functions
-py -3 -m tools.func_id game_files/default.xbe -v
-#    Output: tools/func_id/output/ (CRT, RenderWare, vtables classified)
+# 5. Disassemble — all output paths are explicit and target-specific
+py -3 -m tools.disasm game_files/default.xbe \
+  --analysis-json analysis/target_analysis.json \
+  --target-profile targets/my-game.json \
+  --output analysis/disasm
 
-# 6. Lift to C — the big one
-py -3 -m tools.recomp game_files/default.xbe --all --split 1000
-#    Output: src/game/recomp/gen/ (millions of lines of C)
+# 6. Identify library and game functions
+py -3 -m tools.func_id game_files/default.xbe \
+  --analysis-json analysis/target_analysis.json \
+  --target-profile targets/my-game.json \
+  --functions analysis/disasm/functions.json \
+  --strings analysis/disasm/strings.json \
+  --xrefs analysis/disasm/xrefs.json \
+  --output analysis/func-id -v
 
-# 7. Set up runtime shims (see docs/runtime/ for templates)
-#    - Xbox kernel replacement (115 ordinals resolved)
-#    - D3D8 -> D3D11 translation layer
-#    - Memory layout reproduction
-#    - Input system
+# 7. Lift to C — databases from another target are rejected
+py -3 -m tools.recomp game_files/default.xbe \
+  --analysis-json analysis/target_analysis.json \
+  --target-profile targets/my-game.json \
+  --functions analysis/disasm/functions.json \
+  --labels analysis/disasm/labels.json \
+  --identified analysis/func-id/identified_functions.json \
+  --output-dir analysis/recomp \
+  --all --split 1000 --gen-dir src/recomp/gen
 
-# 8. Build and run
+# 8. Set up and validate runtime surfaces (see docs/runtime/)
+#    - Exact-XBE memory and kernel-thunk initialization
+#    - Graphics path required by this title and host
+#    - Audio and input behavior required by this title
+#    - Game/save path translation and evidence-backed overrides
+
+# 9. Build and run
 cmake -S . -B build
 cmake --build build --config Release
 bin/your_game.exe
@@ -276,6 +299,7 @@ xboxrecomp/
 - [Iterative Debugging](docs/pipeline/06-debugging.md)
 
 ### Technical Deep Dives
+- [Target Profiles](docs/technical/target-profiles.md) — Per-title addresses, exact-XBE validation, and fail-closed tool inputs
 - [The Register Model](docs/technical/register-model.md) — Why global registers work and how the stack is simulated
 - [Memory Layout Reproduction](docs/technical/memory-layout.md) — CreateFileMapping, mirror views, and address space tricks
 - [Indirect Call Dispatch](docs/technical/indirect-calls.md) — The RECOMP_ICALL problem and how to solve it
@@ -288,7 +312,7 @@ xboxrecomp/
 
 ### Xbox Formats
 - [XBE File Format](docs/formats/xbe.md) — Xbox executable format reference
-- [Xbox Kernel Exports](docs/formats/kernel-exports.md) — All 366 kernel functions documented
+- [Xbox Kernel Exports](docs/formats/kernel-exports.md) — Ordinal-based kernel export reference
 
 ## How The Key Pieces Work
 
@@ -315,13 +339,15 @@ Every recompiled function is `void func(void)` — arguments pass through the si
 Xbox has 64 MB of unified RAM. We reproduce the exact address layout:
 
 ```c
-// Create shared memory object
-HANDLE h = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, 64*1024*1024, NULL);
+// Create one 64 MB shared Xbox RAM backing store.
+HANDLE h = CreateFileMapping(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+                             0, 64 * 1024 * 1024, NULL);
 
-// Map at Xbox virtual addresses
-MapViewOfFileEx(h, FILE_MAP_ALL_ACCESS, 0, offset, size, (LPVOID)0x00010000);  // XBE
-MapViewOfFileEx(h, FILE_MAP_ALL_ACCESS, 0, offset, size, (LPVOID)0x80000000);  // mirror
-// ... 28 views total covering the Xbox address space
+// Map the base view, then alias the same pages at 64 MB intervals.
+void *base = MapViewOfFileEx(h, FILE_MAP_ALL_ACCESS, 0, 0,
+                             64 * 1024 * 1024, preferred_base);
+MapViewOfFileEx(h, FILE_MAP_ALL_ACCESS, 0, 0,
+                64 * 1024 * 1024, (uint8_t *)base + 64 * 1024 * 1024);
 ```
 
 Why `CreateFileMapping` instead of `VirtualAlloc`? The Xbox has **mirror regions** — the same physical memory at multiple virtual addresses. File mapping gives us true aliases; VirtualAlloc would give separate copies where writes in one aren't visible in the other.
@@ -340,7 +366,7 @@ The single hardest challenge. When the game does `call [eax+0x10]` (a virtual me
 } while(0)
 ```
 
-Most ICALLs resolve through the auto-generated dispatch table (binary search over all function addresses). The rest are either kernel calls (0xFE000000+ range) or garbage pointers from corrupted vtables that need per-function guards.
+Most ICALLs resolve through the auto-generated dispatch table. The generated target profile supplies the complete set of approved code ranges, so non-code VAs are rejected without hand-editing a Burnout-era `.text` boundary. Kernel calls use the separate synthetic 0xFE000000+ range.
 
 ### NV2A Register Combiners → HLSL
 

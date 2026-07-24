@@ -78,14 +78,13 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         MultiByteToWideChar(CP_UTF8, 0, game_dir, -1, s_game_dir, MAX_PATH);
     } else {
         GetCurrentDirectoryW(MAX_PATH, s_game_dir);
-        wcscat_s(s_game_dir, MAX_PATH, L"\\Burnout 3 Takedown");
     }
 
     if (save_dir) {
         MultiByteToWideChar(CP_UTF8, 0, save_dir, -1, s_save_dir, MAX_PATH);
     } else {
         if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_LOCAL_APPDATA, NULL, 0, save_base))) {
-            swprintf_s(s_save_dir, MAX_PATH, L"%s\\Burnout3", save_base);
+            swprintf_s(s_save_dir, MAX_PATH, L"%s\\xboxrecomp\\SaveData", save_base);
         } else {
             GetCurrentDirectoryW(MAX_PATH, s_save_dir);
             wcscat_s(s_save_dir, MAX_PATH, L"\\SaveData");
@@ -209,7 +208,7 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         char cwd[MAX_PATH];
         if (!getcwd(cwd, sizeof(cwd)))
             snprintf(cwd, sizeof(cwd), ".");
-        snprintf(s_game_dir, sizeof(s_game_dir), "%s/Burnout 3 Takedown", cwd);
+        snprintf(s_game_dir, sizeof(s_game_dir), "%s", cwd);
     }
 
     if (save_dir) {
@@ -218,10 +217,10 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         /* XDG base-directory spec: $XDG_DATA_HOME or ~/.local/share */
         const char* xdg = getenv("XDG_DATA_HOME");
         if (xdg && xdg[0]) {
-            snprintf(s_save_dir, sizeof(s_save_dir), "%s/burnout3", xdg);
+            snprintf(s_save_dir, sizeof(s_save_dir), "%s/xboxrecomp/SaveData", xdg);
         } else {
             const char* home = getenv("HOME");
-            snprintf(s_save_dir, sizeof(s_save_dir), "%s/.local/share/burnout3",
+            snprintf(s_save_dir, sizeof(s_save_dir), "%s/.local/share/xboxrecomp/SaveData",
                      (home && home[0]) ? home : ".");
         }
     }

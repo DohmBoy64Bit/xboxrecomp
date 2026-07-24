@@ -2,12 +2,8 @@
 """
 Merge Ghidra-exported names into a clean {address: name} map for the recompiler.
 
-Reads the JSONs produced by ExportXbeNames.py:
-  tools/ghidra_naming/export/functions.json
-  tools/ghidra_naming/export/symbols.json
-
-Produces:
-  tools/ghidra_naming/ghidra_names.json   -> { "0x00352560": "name", ... }
+Reads an explicit target-specific Ghidra export directory and writes an
+explicit target-specific name map. No repository-global output path is selected.
 
 Only MEANINGFUL names are kept. Ghidra auto-generated placeholders are excluded:
   FUN_*, LAB_*, DAT_*, SUB_*, UNK_*, EXT_*, OFF_*, thunk_FUN_*, switchD_*,
@@ -23,13 +19,9 @@ The script classifies each recovered name by SOURCE for reporting:
   demangled     - names that look demangled (contain :: or were demangled)
   symbol        - any other user/imported/analysis symbol with a real name
 
---apply (OPTIONAL, NOT run by default): updates
-  tools/disasm/output/functions.json in place (writes a .bak first), setting the
-  `name` field for entries whose `start` address matches a recovered name.
-
-Usage:
-  py -3 tools/ghidra_naming/merge_names.py
-  py -3 tools/ghidra_naming/merge_names.py --apply       # (do not run unless asked)
+--apply is optional and writes a `.bak` before modifying the explicitly supplied
+functions database. Application requires a validated target profile so names
+cannot be merged into another title's database.
 """
 import argparse
 import json
@@ -40,10 +32,9 @@ import sys
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.normpath(os.path.join(_HERE, "..", ".."))
 
-DEFAULT_EXPORT_DIR = os.path.join(_HERE, "export")
-DEFAULT_OUT = os.path.join(_HERE, "ghidra_names.json")
-DEFAULT_FUNCTIONS_JSON = os.path.join(_REPO, "tools", "disasm", "output",
-                                      "functions.json")
+sys.path.insert(0, _REPO)
+
+from tools.target_profile import TargetProfileError, load_target_profile  # noqa: E402
 
 # Ghidra default/placeholder name prefixes (case-insensitive prefix match).
 # Auto-generated for unnamed code/data; never meaningful function names.
@@ -286,22 +277,31 @@ def apply_to_functions_json(final, functions_json_path):
 
 
 def main():
+    """Parse explicit target inputs, build a name map, and optionally apply it."""
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--export-dir", default=DEFAULT_EXPORT_DIR,
-                    help="Dir with Ghidra functions.json/symbols.json")
-    ap.add_argument("--out", default=DEFAULT_OUT,
-                    help="Output ghidra_names.json path")
-    ap.add_argument("--functions-json", default=DEFAULT_FUNCTIONS_JSON,
-                    help="Recompiler functions.json (for --apply)")
+    source_group = ap.add_mutually_exclusive_group(required=True)
+    source_group.add_argument("--export-dir",
+                              help="Target-specific dir with Ghidra functions.json/symbols.json")
+    source_group.add_argument("--names-json",
+                              help="Existing target-specific {address: name} JSON map")
+    ap.add_argument("--out", required=True,
+                    help="Explicit target-specific ghidra_names.json output path")
+    ap.add_argument("--functions-json",
+                    help="Explicit target functions.json used for matching or --apply")
+    ap.add_argument("--target-profile",
+                    help="Per-title profile required when functions.json is supplied")
+    ap.add_argument("--analysis-json",
+                    help="Exact target parser JSON used to validate the profile")
+    ap.add_argument("--xbe", help="Exact target XBE used to validate the profile")
     ap.add_argument("--apply", action="store_true",
                     help="Apply names into functions.json in place (.bak first)")
-    ap.add_argument("--names-json",
-                    help="Skip the Ghidra export and take names from an existing "
-                         "{addr: name} file, e.g. the output of "
-                         "tools/symbols/map_names.py. Names are still sanitized "
-                         "and de-duplicated the same way.")
     args = ap.parse_args()
+
+    if args.apply and not args.functions_json:
+        ap.error("--apply requires --functions-json")
+    if args.functions_json and not (args.target_profile or args.analysis_json):
+        ap.error("--functions-json requires --target-profile or --analysis-json")
 
     if args.names_json:
         raw = load_json(args.names_json) or {}
@@ -324,12 +324,39 @@ def main():
         final, buckets, _chosen = build_map(args.export_dir)
     n = write_map(final, args.out)
 
-    # How many of these addresses actually exist in the recompiler's functions.json?
+    # Cross-check an explicitly supplied functions database against the selected target.
     matched_in_recomp = None
-    if os.path.exists(args.functions_json):
+    if args.functions_json:
+        if not os.path.isfile(args.functions_json):
+            ap.error("functions database not found: %s" % args.functions_json)
+        try:
+            profile = load_target_profile(
+                profile_path=args.target_profile,
+                analysis_json=args.analysis_json,
+                xbe_path=args.xbe,
+            )
+        except TargetProfileError as exc:
+            ap.error(str(exc))
         with open(args.functions_json, "r") as f:
             recomp = json.load(f)
-        recomp_starts = set(norm_addr(e.get("start")) for e in recomp)
+        if not isinstance(recomp, list):
+            ap.error("functions.json must contain a list")
+        recomp_starts = set()
+        for index, entry in enumerate(recomp):
+            try:
+                start = int(norm_addr(entry.get("start")), 16)
+                if "end" in entry:
+                    end = int(norm_addr(entry["end"]), 16)
+                elif "size" in entry:
+                    size_value = entry["size"]
+                    size = int(size_value, 0) if isinstance(size_value, str) else int(size_value)
+                    end = start + size
+                else:
+                    raise ValueError("missing end/size")
+                profile.validate_code_range(start, end, "function[%d]" % index)
+            except (TypeError, ValueError, TargetProfileError) as exc:
+                ap.error("invalid functions database: %s" % exc)
+            recomp_starts.add(norm_addr(start))
         matched_in_recomp = sum(1 for a in final if a in recomp_starts)
 
     print("=" * 60)

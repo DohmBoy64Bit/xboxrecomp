@@ -27,13 +27,28 @@ XBOX_HARDWARE_INFO xbox_HardwareInfo = {
     .Reserved    = {0, 0}
 };
 
-/* Kernel version - match XDK 5849 (the version Burnout 3 was built against) */
+/* Kernel version populated from the exact target XBE library metadata. */
 XBOX_KRNL_VERSION xbox_KrnlVersion = {
     .Major = 1,
     .Minor = 0,
-    .Build = 5849,
-    .Qfe   = 1
+    .Build = 0,
+    .Qfe   = 0
 };
+
+/**
+ * Update the emulated kernel version for the current target.
+ */
+void xbox_kernel_set_version(USHORT major, USHORT minor, USHORT build, USHORT qfe)
+{
+    xbox_KrnlVersion.Major = major;
+    xbox_KrnlVersion.Minor = minor;
+    xbox_KrnlVersion.Build = build;
+    xbox_KrnlVersion.Qfe = qfe;
+
+    xbox_log(XBOX_LOG_INFO, XBOX_LOG_XBOX,
+        "Kernel version selected from XBE metadata: %u.%u.%u.%u",
+        major, minor, build, qfe);
+}
 
 /* Crypto keys - zeroed, not needed for PC operation.
  * These are unique per-console on real hardware. */

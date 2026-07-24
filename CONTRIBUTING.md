@@ -38,11 +38,11 @@ See the [README](README.md) for the detailed directory tree and architecture dia
 
 The most valuable contribution is trying the toolkit on a new game. Follow the Quick Start in the README, and report what works and what breaks. Even partial results (e.g., "disassembly finds 2,000 functions but the lifter chokes on SSE2 code in function X") help improve the toolkit.
 
-To get started with a new game project, copy the template from `templates/new-game/` and customize it. See the template files for detailed comments.
+To get started with a new game project, copy the template from `templates/new-game/`. Parse the exact XBE, generate a per-title target profile, validate that profile against both the parser JSON and XBE bytes, and pass the profile explicitly to disassembly, function identification, and recompilation. Never replace repository-global constants with one game's addresses and never let a command silently select a reference profile. See [Target Profiles](docs/technical/target-profiles.md) and the template files.
 
-### Add New Kernel Imports
+### Add New Kernel Exports
 
-The Xbox kernel exports 366 functions. We currently implement 147 of them. Adding more is straightforward:
+The verified Xbox kernel export directory uses ordinal slots through 378, with null gaps at 367–373. A title imports only the subset found in its exact XBE thunk table. Runtime support varies by ordinal and must be measured from current source and behavior rather than a stale aggregate count. To add or improve an export:
 
 1. Find the kernel ordinal your game needs. The recompiler logs unresolved kernel calls at runtime (look for `[KERNEL] Unimplemented ordinal XXX` messages).
 2. Look up the function signature on the [Xbox Dev Wiki kernel exports page](https://xboxdevwiki.net/Kernel).
@@ -73,8 +73,9 @@ The x86-to-C lifter lives in `tools/recomp/lifter.py`. It handles approximately 
 
 When adding instruction support:
 1. Add the translation pattern in `lifter.py`.
-2. Test on a real game function that uses that instruction.
-3. Verify the recompiled function produces the same behavior.
+2. Preserve 100% docstring coverage for every new or modified Python module, class, function, async function, and nested function.
+3. Add a focused automated test and test on a real game function that uses the instruction.
+4. Verify the recompiled function produces the same behavior under the exact target profile.
 
 ### Add New Runtime Features
 
@@ -97,16 +98,22 @@ Every Xbox game has its own asset formats. If you reverse-engineer a texture for
 - 4-space indentation, no tabs.
 - Function names: `xbox_ModuleName_FunctionName` for public APIs, `snake_case` for internal helpers.
 - Comments: explain *why*, not *what*. The code should be readable on its own.
+- Python code must maintain 100% AST docstring coverage for every new or modified module, class, function, async function, and nested function.
+- Target-bound values belong in a validated target profile or target project, not shared `config.py` modules.
 - Keep files focused. Each kernel source file covers one subsystem.
 
 ## Testing
 
-There is no automated test suite (yet). Testing is manual:
+Run the automated checks that cover the changed surface, then perform target and cross-target runtime validation:
 
-1. Build the runtime libraries.
-2. Build a game project that uses them (Burnout 3, Wreckless, Blood Wake, or your own).
-3. Run the recompiled game and verify it progresses further than before your change.
-4. Check for regressions by running other games if your change touches shared code.
+1. Run `python -m unittest tools.test_target_profile -v` for target-profile and fail-closed pipeline behavior.
+2. Run `python -m compileall -q tools` and the repository's relevant focused tests.
+3. Build the runtime libraries from a clean directory on each supported host configuration affected by the change.
+4. Build a game project with an exact XBE, parser JSON, and validated target profile.
+5. Run the recompiled game and verify the declared checkpoint rather than treating a build as runtime proof.
+6. Run available reference-title regressions whenever shared code changes.
+
+The repository does not yet provide complete automated runtime or parity coverage. Preserve that limitation and record every unavailable platform, dependency, and test surface.
 
 The VEH crash handler and ICALL trace ring buffer are your primary debugging tools. When a game crashes, the handler prints the faulting address, all Xbox register values, and recent indirect call targets.
 

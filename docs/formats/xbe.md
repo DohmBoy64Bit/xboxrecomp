@@ -35,17 +35,17 @@ The XBE header begins at file offset 0 and contains the following fields:
 | 0x013C | 4 | PeSizeOfImage | PE-compatible image size |
 | 0x0140 | 4 | PeChecksum | PE-compatible checksum |
 | 0x0144 | 4 | PeTimeDateStamp | PE-compatible timestamp |
-| 0x0148 | 4 | DebugPathnameAddress | VA of debug build path string |
-| 0x014C | 4 | DebugFilenameAddress | VA of debug build filename string |
-| 0x0150 | 4 | DebugUnicodeFilenameAddress | VA of Unicode debug filename |
-| 0x0154 | 4 | KernelThunkAddress | Encoded kernel thunk table address |
-| 0x0158 | 4 | NonKernelImportDirectoryAddress | Non-kernel import directory |
-| 0x015C | 4 | NumberOfLibraryVersions | Number of library version entries |
-| 0x0160 | 4 | LibraryVersionsAddress | VA of library version array |
-| 0x0164 | 4 | KernelLibraryVersionAddress | VA of kernel lib version entry |
-| 0x0168 | 4 | XapiLibraryVersionAddress | VA of XAPI lib version entry |
-| 0x016C | 4 | LogoBitmapAddress | VA of the Xbox logo bitmap |
-| 0x0170 | 4 | LogoBitmapSize | Size of the logo bitmap |
+| 0x014C | 4 | DebugPathnameAddress | VA of debug build path string |
+| 0x0150 | 4 | DebugFilenameAddress | VA of debug build filename string |
+| 0x0154 | 4 | DebugUnicodeFilenameAddress | VA of Unicode debug filename |
+| 0x0158 | 4 | KernelThunkAddress | Encoded kernel thunk table address |
+| 0x015C | 4 | NonKernelImportDirectoryAddress | Non-kernel import directory |
+| 0x0160 | 4 | NumberOfLibraryVersions | Number of library version entries |
+| 0x0164 | 4 | LibraryVersionsAddress | VA of library version array |
+| 0x0168 | 4 | KernelLibraryVersionAddress | VA of kernel lib version entry |
+| 0x016C | 4 | XapiLibraryVersionAddress | VA of XAPI lib version entry |
+| 0x0170 | 4 | LogoBitmapAddress | VA of the Xbox logo bitmap |
+| 0x0174 | 4 | LogoBitmapSize | Size of the logo bitmap |
 
 ### Base Address
 
@@ -76,12 +76,12 @@ if (entry_retail >= text_va && entry_retail < text_va + text_size) {
 
 ### Kernel Thunk Address Encoding
 
-The kernel thunk table address at offset 0x0154 is similarly XOR-encoded:
+The kernel thunk table address at offset 0x0158 is similarly XOR-encoded:
 
 - **Retail XBEs**: XOR key = `0x5B6D40B6`
 - **Debug XBEs**: XOR key = `0xEFB1F152`
 
-The decoded address points to an array of 32-bit ordinal values (terminated by 0) that index into the Xbox kernel's export table.
+The decoded address points to a zero-terminated array of 32-bit values. Each nonzero value is `0x80000000 | ordinal`; supported retail kernel tables use ordinal values through 378, with some ordinal gaps.
 
 ## Section Table
 
@@ -217,7 +217,7 @@ Raw value:  0x80000001
 Ordinal:    value & 0x7FFFFFFF = 1 (AvGetSavedDataAddress)
 ```
 
-Games typically import 100-200 kernel functions. The Xbox kernel exports up to 366 functions and data objects. See [kernel-exports.md](kernel-exports.md) for the full list of commonly imported ordinals.
+Import counts are title-specific. The verified kernel export directory uses ordinal slots through 378, with null gaps at 367–373. See [kernel-exports.md](kernel-exports.md) for commonly encountered ordinals; the exact target thunk table remains the source of truth for one XBE.
 
 ## Practical Notes for Recompilation
 

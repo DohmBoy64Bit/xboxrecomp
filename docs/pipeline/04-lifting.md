@@ -51,7 +51,9 @@ The callee-save contract is enforced by the generated code itself -- the lifter 
 For the ~200 functions that use SEH (Structured Exception Handling), a special bridge variable `g_seh_ebp` transfers the `ebp` value between the SEH prolog helper and the calling function:
 
 ```c
-// In __SEH_prolog (sub_00244784):
+// Reference-title example only. The selected target profile supplies the
+// evidence-backed SEH helper address; no Burnout address is inherited.
+// In __SEH_prolog (example sub_00244784):
 g_seh_ebp = ebp;   // write bridge
 
 // In the calling function, after call to __SEH_prolog:
@@ -260,8 +262,8 @@ The `RECOMP_ICALL` macro implements a 3-tier lookup:
     g_icall_trace[g_icall_trace_idx & (ICALL_TRACE_SIZE-1)] = _va;  \
     g_icall_trace_idx++;                                            \
     g_icall_count++;                                                \
-    /* Early-out: garbage VA range */                               \
-    if (_va >= 0x00400000 && _va < 0xFE000000) {                    \
+    /* Reject ordinary VAs outside the selected target's code sections. */ \
+    if (_va < 0xFE000000u && !XBOX_TARGET_IS_CODE_ADDRESS(_va)) {   \
         g_esp += 4; eax = 0; break;                                \
     }                                                               \
     /* Tier 1: manual overrides (hand-written replacements) */      \
@@ -275,7 +277,7 @@ The `RECOMP_ICALL` macro implements a 3-tier lookup:
 } while(0)
 ```
 
-If lookup fails, the dummy return address is popped from the stack to prevent stack leaks. Without this, each failed indirect call would leak 4 bytes of stack space per frame.
+The `XBOX_TARGET_IS_CODE_ADDRESS` predicate is generated from the validated profile and covers every approved code section; it must not be replaced with one reference title's broad range. If lookup fails, the dummy return address is popped from the stack to prevent stack leaks. Without this, each failed indirect call would leak 4 bytes of stack space per frame.
 
 ## FPU (x87 Floating Point)
 
@@ -404,7 +406,12 @@ static const size_t dispatch_table_size = 22097;
 With 22,095 functions, a single C file would be enormous and slow to compile. The `--split N` option distributes functions across multiple files, each containing at most N functions:
 
 ```bash
-py -3 -m tools.recomp "default.xbe" --all --split 1000
+py -3 -m tools.recomp "default.xbe" \
+  --analysis-json analysis/target_analysis.json \
+  --target-profile targets/my-game.json \
+  --functions analysis/disasm/functions.json \
+  --output-dir analysis/recomp \
+  --all --split 1000 --gen-dir src/recomp/gen
 ```
 
 This produces `recomp_0000.c` through `recomp_0022.c` (23 files for Burnout 3).
@@ -422,14 +429,21 @@ The C compiler's optimizer eliminates most of the overhead. The final binary is 
 ## Invocation
 
 ```bash
-py -3 -m tools.recomp "path/to/default.xbe" --all --split 1000
+py -3 -m tools.recomp "path/to/default.xbe" \
+  --analysis-json analysis/target_analysis.json \
+  --target-profile targets/my-game.json \
+  --functions analysis/disasm/functions.json \
+  --labels analysis/disasm/labels.json \
+  --identified analysis/func-id/identified_functions.json \
+  --abi analysis/abi/abi_functions.json \
+  --output-dir analysis/recomp \
+  --all --split 1000 --gen-dir src/recomp/gen
 ```
 
-Options:
-- `--all`: translate all detected functions (default: only translate functions reachable from entry point)
-- `--split N`: maximum functions per output file
-- `--output-dir <dir>`: where to write generated files (default: `src/game/recomp/gen/`)
-- `--verbose`: print per-function translation progress
+The function database and output directory are required. Optional labels,
+classification, and ABI databases must refer to functions in that same database.
+`--split` requires an explicit `--gen-dir`; generated code is never written to a
+repository-global target directory by silent fallback.
 
 The output directory is typically gitignored because the generated files are large (200+ MB total) and can be regenerated from the XBE at any time.
 

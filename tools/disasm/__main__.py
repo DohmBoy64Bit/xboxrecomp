@@ -5,9 +5,8 @@ Usage:
     py -3 -m tools.disasm <path_to_xbe> [options]
 
 Examples:
-    py -3 -m tools.disasm "Burnout 3 Takedown/default.xbe" --text-only --stats-only -v
-    py -3 -m tools.disasm "Burnout 3 Takedown/default.xbe" --text-only
-    py -3 -m tools.disasm "Burnout 3 Takedown/default.xbe" -o output/
+    py -3 -m tools.disasm game_files/default.xbe --analysis-json analysis.json --text-only -v
+    py -3 -m tools.disasm game_files/default.xbe --analysis-json analysis.json -o output/
 """
 
 import argparse
@@ -17,10 +16,10 @@ from .disasm import Disassembler
 
 
 def main():
+    """Parse CLI arguments and run target-bound XBE disassembly."""
     parser = argparse.ArgumentParser(
         prog="tools.disasm",
-        description="Burnout 3 XBE Disassembly Tool - "
-                    "Static analysis and function detection for Xbox executables",
+        description="Xbox XBE disassembly tool - static analysis and function detection",
     )
 
     parser.add_argument(
@@ -30,19 +29,26 @@ def main():
     parser.add_argument(
         "-o", "--output",
         dest="output_dir",
-        default=None,
-        help="Output directory for JSON databases and ASM listings "
-             "(default: tools/disasm/output/)",
+        required=True,
+        help="Target-specific output directory for JSON databases and ASM listings",
     )
     parser.add_argument(
         "--analysis-json",
+        required=True,
+        help="Path to parser analysis JSON for the exact target XBE",
+    )
+    parser.add_argument(
+        "--target-profile",
         default=None,
-        help="Path to burnout3_analysis.json (auto-detected if not specified)",
+        help=(
+            "Per-title profile for section roles and annotations. When supplied, it is "
+            "cross-checked against the exact analysis JSON and XBE."
+        ),
     )
     parser.add_argument(
         "--text-only",
         action="store_true",
-        help="Only disassemble the .text section (faster, ~2.73 MB)",
+        help="Only disassemble the selected target's .text section",
     )
     parser.add_argument(
         "--stats-only",
@@ -82,6 +88,7 @@ def main():
         disassembler = Disassembler(
             xbe_path=args.xbe_path,
             analysis_json=args.analysis_json,
+            target_profile=args.target_profile,
             output_dir=args.output_dir,
             text_only=args.text_only,
             stats_only=args.stats_only,

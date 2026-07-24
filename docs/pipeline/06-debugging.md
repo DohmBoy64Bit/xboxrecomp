@@ -119,34 +119,29 @@ eax = MEM32(ecx);           // load vtable
 PUSH32(esp, 0xDEAD);
 RECOMP_ICALL(MEM32(eax + 0x10));  // call vtable[4] -- crashes
 
-// After (patched):
+// After (target-aware guard):
 eax = MEM32(ecx);
-if (eax < 0x00011000 || eax > 0x003B2360) {
-    // Vtable pointer is outside valid .text/.rdata range -- skip the call
+uint32_t method_va = MEM32(eax + 0x10);
+if (method_va < 0xFE000000u && !XBOX_TARGET_IS_CODE_ADDRESS(method_va)) {
     goto loc_safe_skip;
 }
 PUSH32(esp, 0xDEAD);
-RECOMP_ICALL(MEM32(eax + 0x10));
+RECOMP_ICALL(method_va);
 ```
 
-### Centralized Early-Out
+### Centralized Target-Profile Early-Out
 
-Rather than guarding every individual ICALL site, the `RECOMP_ICALL` macro includes a range check:
+Rather than inheriting one title's broad range, `RECOMP_ICALL` checks ordinary addresses against the generated target predicate and preserves the synthetic kernel range:
 
 ```c
-if (_va >= 0x00400000 && _va < 0xFE000000) {
+if (_va < 0xFE000000u && !XBOX_TARGET_IS_CODE_ADDRESS(_va)) {
     g_esp += 4;   // pop dummy return address
     eax = 0;      // return "failure"
-    break;         // skip the call
+    break;        // skip the call
 }
 ```
 
-This catches all garbage VAs in one place. The ranges are:
-- `0x00011000` - `0x003B2354`: valid code + data (allow)
-- `0x00400000` - `0xFDFFFFFF`: nothing should be here (block)
-- `0xFE000000` - `0xFE000600`: kernel thunk synthetic VAs (allow)
-
-For Burnout 3, this centralized guard reduced ICALL volume by 33% (from 180/2s to 121/2s) and completely eliminated the most frequent garbage VA (0x1C45BA68).
+The predicate is generated from every code section approved by the selected profile. This handles multiple executable sections and evidence-backed nonstandard code without allowing target data or unmapped gaps. Historical reductions observed in one reference title are useful debugging evidence only, not a portable address policy or expected metric.
 
 ## Stack Leaks
 
@@ -269,11 +264,16 @@ Keep a copy of the original XBE file data in memory. When code needs to read a s
 // Instead of:
 const char *name = (const char *)XBOX_PTR(string_va);
 
-// Use:
-const char *name = (const char *)(g_xbe_data + (string_va - 0x0036B7C0) + 0x0035C000);
+// Use the helper generated from the validated target profile:
+uint32_t file_offset;
+if (!xbox_target_va_to_file_offset(string_va, &file_offset)) {
+    // Reject an address that is not backed by bytes in this exact XBE.
+    return NULL;
+}
+const char *name = (const char *)(g_xbe_data + file_offset);
 ```
 
-The calculation maps the Xbox .rdata VA back to its file offset in the original XBE. The original data is never modified.
+`xbox_target_va_to_file_offset()` is emitted by `python -m tools.target_profile emit-c-header` from the exact title's section VAs, raw offsets, and raw sizes. It rejects BSS-only and out-of-profile addresses instead of inheriting another game's `.rdata` arithmetic. The original file data remains unmodified.
 
 This is only needed for .rdata reads that are sensitive to corruption. Most code can tolerate the mapped memory; only resource loading paths need the fallback.
 

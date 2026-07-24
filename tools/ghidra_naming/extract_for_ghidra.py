@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Prepare a an Xbox XBE for Ghidra headless raw-binary import.
+Prepare an Xbox XBE for Ghidra headless raw-binary import.
 
 Ghidra 12.0.3 has no built-in XBE loader, so we use the project's existing
 xbe_parser to read the section table and build ONE flat raw image that spans
-from the XBE base address (0x00010000) to the end of the highest loadable
-section. Each section's raw bytes are placed at (virtual_addr - base_address),
-with gaps zero-filled.
+from the exact XBE base address to the end of the highest loadable section.
+Each section's raw bytes are placed at (virtual_addr - base_address), with gaps
+zero-filled.
 
-Because the image starts at the XBE base, a Ghidra import with image base
-0x00010000 yields virtual addresses that match the recompiler's
-functions.json `start` values exactly (Xbox VAs).
+Because the image starts at the parsed XBE base, importing it at the
+`base_address` recorded in `sections.json` yields virtual addresses that match
+recompiler function starts exactly.
 
-Outputs (into --out-dir, default tools/ghidra_naming/work):
-  xbe_flat.bin   - flat image, load at image base 0x00010000
-  sections.json       - section metadata + chosen image base/size
+Outputs into the required target-specific `--out-dir`:
+  xbe_flat.bin  - flat image loaded at the base recorded in sections.json
+  sections.json - section metadata plus the exact image base and size
 
 Usage:
-  py -3 tools/ghidra_naming/extract_for_ghidra.py /path/to/default.xbe
+  py -3 tools/ghidra_naming/extract_for_ghidra.py /path/to/default.xbe \
+    --out-dir /path/to/analysis/ghidra/work
 """
 import argparse
 import json
@@ -37,7 +38,8 @@ from xbe_parser import XBEParser, format_flags  # noqa: E402
 # from code into .rdata/.data resolve.
 
 
-def build(xbe_path: str, out_dir: str, include_all: bool = True):
+def build(xbe_path: str, out_dir: str):
+    """Build one flat Ghidra image and metadata set from an exact XBE."""
     os.makedirs(out_dir, exist_ok=True)
     parser = XBEParser(xbe_path)
     xbe = parser.parse()
@@ -118,10 +120,11 @@ def build(xbe_path: str, out_dir: str, include_all: bool = True):
 
 
 def main():
+    """Parse explicit XBE/output arguments and build the flat Ghidra image."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("xbe_path", help="Path to default.xbe")
-    ap.add_argument("--out-dir", default=os.path.join(_HERE, "work"),
-                    help="Output directory (default tools/ghidra_naming/work)")
+    ap.add_argument("--out-dir", required=True,
+                    help="Explicit target-specific output directory")
     args = ap.parse_args()
     if not os.path.exists(args.xbe_path):
         print("Error: not found: %s" % args.xbe_path, file=sys.stderr)

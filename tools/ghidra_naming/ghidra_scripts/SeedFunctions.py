@@ -2,18 +2,18 @@
 #
 # The flat raw image has no symbol table, so Ghidra's auto-analysis only finds
 # functions reachable from the entry point / references / prologue patterns.
-# The project's own disassembler already identified 22,178 function starts in
-# tools/disasm/output/functions.json. Seeding those exact addresses as functions
-# lets Function ID + the decompiler operate on properly-bounded bodies at the
-# addresses the recompiler keys on, maximizing name-transfer overlap.
+# The selected target's own disassembler database supplies candidate function
+# starts. Seeding those explicit addresses lets Function ID + the decompiler
+# operate on the same address identity used by the target profile.
 #
 # Run as a -preScript (BEFORE auto-analysis). Jython.
 #
-# Arg0 (optional): path to functions.json
-#                  (default: <repo>/tools/disasm/output/functions.json)
+# Arg0 (required): explicit target-specific path to functions.json
 #
 # @category XboxRecomp
 # @runtime Jython
+
+"""Seed Ghidra from one explicitly supplied target function database."""
 import json
 import os
 
@@ -21,17 +21,12 @@ from ghidra.program.model.address import AddressSet
 
 
 def run():
+    """Seed Ghidra only from an explicitly supplied target functions database."""
     args = getScriptArgs()
-    if len(args) >= 1 and args[0]:
-        fj = args[0]
-    else:
-        # repo/tools/ghidra_naming/ghidra_scripts/.. -> repo/tools/disasm/...
-        try:
-            _here = os.path.dirname(os.path.abspath(__file__))
-            _repo = os.path.dirname(os.path.dirname(os.path.dirname(_here)))
-            fj = os.path.join(_repo, "tools", "disasm", "output", "functions.json")
-        except NameError:
-            fj = ""  # __file__ unavailable under headless; pass functions.json as arg0
+    if len(args) < 1 or not args[0]:
+        print("[seed] explicit target functions.json argument required (skipping seed)")
+        return
+    fj = args[0]
 
     if not os.path.exists(fj):
         print("[seed] functions.json not found: %s (skipping seed)" % fj)

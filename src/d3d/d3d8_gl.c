@@ -979,7 +979,7 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE,  24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
 
-    g.window = SDL_CreateWindow("Burnout 3: Takedown",
+    g.window = SDL_CreateWindow("xboxrecomp target",
                                 SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
                                 g.backbuf_w, g.backbuf_h,
                                 SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);

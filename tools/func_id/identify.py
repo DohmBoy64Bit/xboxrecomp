@@ -18,39 +18,102 @@ from .stub_classifier import classify_stubs
 from .vtable_scanner import scan_vtables
 from .clustering import propagate_labels
 from .output import write_results
+from tools.target_profile import TargetProfile, TargetProfileError, load_target_profile
+
+
+def _address_value(value, field_name):
+    """Parse a database address field without accepting ambiguous booleans."""
+    if isinstance(value, bool):
+        raise TargetProfileError(f"{field_name} must be an address, not a boolean")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value, 0)
+        except ValueError as exc:
+            raise TargetProfileError(
+                f"{field_name} is not a valid integer address: {value!r}"
+            ) from exc
+    raise TargetProfileError(f"{field_name} is missing or has an unsupported type")
+
+
+def _validate_function_database(functions, profile: TargetProfile):
+    """Bind every function record to one approved section in the selected profile."""
+    if not isinstance(functions, list):
+        raise TargetProfileError("functions.json must contain a list of function records")
+    seen = set()
+    for index, function in enumerate(functions):
+        if not isinstance(function, dict):
+            raise TargetProfileError(f"function record {index} must be a JSON object")
+        start = _address_value(function.get("start"), f"function[{index}].start")
+        if start in seen:
+            raise TargetProfileError(
+                f"functions.json contains duplicate start address 0x{start:08X}"
+            )
+        seen.add(start)
+        if "end" in function:
+            end = _address_value(function["end"], f"function[{index}].end")
+        elif "size" in function:
+            size = _address_value(function["size"], f"function[{index}].size")
+            end = start + size
+        else:
+            raise TargetProfileError(
+                f"function[{index}] at 0x{start:08X} has neither end nor size"
+            )
+        profile.validate_code_range(start, end, f"function[{index}]")
+
 
 
 def run(xbe_path, functions_path=None, strings_path=None, xrefs_path=None,
-        output_dir=None, verbose=False):
+        output_dir=None, verbose=False, analysis_json=None, target_profile=None):
     """
     Run the full function identification pipeline.
 
     Args:
         xbe_path: Path to the XBE file.
-        functions_path: Path to functions.json (or default).
-        strings_path: Path to strings.json (or default).
-        xrefs_path: Path to xrefs.json (or default).
-        output_dir: Output directory (or default).
+        functions_path: Explicit path to this target's functions.json.
+        strings_path: Explicit path to this target's strings.json.
+        xrefs_path: Explicit path to this target's xrefs.json.
+        output_dir: Explicit target-specific output directory.
         verbose: Print progress info.
+        analysis_json: Parser analysis JSON for the exact target XBE.
+        target_profile: Optional per-title profile to cross-check and annotate analysis.
 
     Returns:
         dict: Summary statistics.
     """
-    functions_path = functions_path or config.DEFAULT_FUNCTIONS_JSON
-    strings_path = strings_path or config.DEFAULT_STRINGS_JSON
-    xrefs_path = xrefs_path or config.DEFAULT_XREFS_JSON
-    output_dir = output_dir or config.DEFAULT_OUTPUT_DIR
+    profile = load_target_profile(
+        profile_path=target_profile,
+        analysis_json=analysis_json,
+        xbe_path=xbe_path,
+    )
+    config.configure_target(profile)
+
+    required_paths = {
+        "functions_path": functions_path,
+        "strings_path": strings_path,
+        "xrefs_path": xrefs_path,
+        "output_dir": output_dir,
+    }
+    missing = [name for name, value in required_paths.items() if not value]
+    if missing:
+        raise ValueError(
+            "function identification requires explicit target paths: "
+            + ", ".join(missing)
+        )
 
     t_start = time.time()
 
     # ── Phase 0: Load inputs ──────────────────────────────────
     if verbose:
         print("Phase 0: Loading inputs...")
+        print(f"  Target profile: {profile.profile_id} ({profile.title})")
 
     xbe_data = _load_binary(xbe_path)
     functions = _load_json(functions_path)
     strings = _load_json(strings_path)
     xrefs = _load_json(xrefs_path)
+    _validate_function_database(functions, profile)
 
     if verbose:
         print(f"  XBE: {len(xbe_data):,} bytes")
@@ -76,9 +139,14 @@ def run(xbe_path, functions_path=None, strings_path=None, xrefs_path=None,
     if verbose:
         print("\nPhase 2: RenderWare identification...")
     t2 = time.time()
-    rw_results, rw_modules = identify_rw_functions(
-        strings, imm_refs, functions, verbose=verbose
-    )
+    if profile.renderware_identification:
+        rw_results, rw_modules = identify_rw_functions(
+            strings, imm_refs, functions, verbose=verbose
+        )
+    else:
+        rw_results, rw_modules = {}, {}
+        if verbose:
+            print("  Skipped: target profile does not enable RenderWare identification")
     if verbose:
         print(f"  Done in {time.time() - t2:.1f}s")
 
@@ -124,16 +192,26 @@ def run(xbe_path, functions_path=None, strings_path=None, xrefs_path=None,
         print("\nPhase 5: Vtable scanning...")
     t5 = time.time()
 
-    # Parse section info from XBE for game-agnostic vtable scanning
-    xbe_sections = _parse_xbe_sections(xbe_data)
-    if verbose and xbe_sections:
-        code_count = sum(1 for s in xbe_sections if s.get("executable"))
-        data_count = len(xbe_sections) - code_count
-        print(f"  XBE sections: {len(xbe_sections)} ({code_count} code, {data_count} data)")
+    profile_sections = [
+        {
+            "name": section.name,
+            "va": section.virtual_address,
+            "size": section.virtual_size,
+            "raw": section.raw_address,
+            "raw_size": section.raw_size,
+            "executable": section.is_code,
+            "role": section.role,
+        }
+        for section in profile.sections
+    ]
+    if verbose:
+        print(
+            f"  Target sections: {len(profile_sections)} "
+            f"({len(profile.code_sections)} code, {len(profile.data_sections)} data)"
+        )
 
     vtable_results, vtables = scan_vtables(
-        xbe_data, functions, imm_refs, verbose=verbose,
-        sections=xbe_sections if xbe_sections else None
+        xbe_data, functions, imm_refs, verbose=verbose, sections=profile_sections
     )
     # Only classify functions not already labeled by earlier phases
     already_labeled = set(rw_results) | set(crt_results) | set(propagated) | set(stub_results)
@@ -150,13 +228,17 @@ def run(xbe_path, functions_path=None, strings_path=None, xrefs_path=None,
     thunk_count = 0
     for addr, info in vtable_results.items():
         if addr not in func_starts and info.get("method") == "vtable_thunk":
-            est_size = 32  # estimate; refined later if re-disassembled
+            target_section = profile.section_for_address(addr)
+            if target_section is None or not target_section.is_code:
+                continue
+            estimated_end = min(addr + 32, target_section.virtual_end)
+            estimated_size = estimated_end - addr
             functions.append({
                 "start": f"0x{addr:08X}",
-                "end": f"0x{addr + est_size:08X}",
-                "size": est_size,
+                "end": f"0x{estimated_end:08X}",
+                "size": estimated_size,
                 "name": f"sub_{addr:08X}",
-                "section": ".text",
+                "section": target_section.name,
                 "insn_count": 8,
                 "type": "vtable_thunk",
                 "vtable_addr": f"0x{info.get('vtable_addr', 0):08X}",
@@ -195,18 +277,13 @@ def _merge_xref_data_reads(xrefs, functions, imm_refs, verbose):
     # Build sorted function start list for binary search
     func_starts = sorted(int(f["start"], 16) for f in functions)
 
-    rdata_lo = config.RDATA_VA_START
-    rdata_hi = config.RDATA_VA_END
-    data_lo = config.DATA_VA_START
-    data_hi = config.DATA_VA_END
-
     count = 0
     for xref in xrefs:
         if xref["type"] != "data_read":
             continue
 
         target = int(xref["to"], 16)
-        if not ((rdata_lo <= target < rdata_hi) or (data_lo <= target < data_hi)):
+        if not config.is_data_address(target):
             continue
 
         source = int(xref["from"], 16)

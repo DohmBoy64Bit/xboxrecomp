@@ -56,9 +56,13 @@ def scan_vtables(xbe_data, functions, imm_refs, verbose=False, sections=None):
 
     # Determine code and data ranges from section info
     if sections:
-        # Code ranges: only the main .text section (where lifted functions live)
-        text_ranges = [(s["va"], s["va"] + s["size"])
-                       for s in sections if s["name"] == ".text"]
+        # Code ranges: every section approved by the active target profile.
+        # Titles commonly place callable XDK or middleware code outside .text.
+        text_ranges = [
+            (section["va"], section["va"] + section["size"])
+            for section in sections
+            if section.get("executable", False)
+        ]
         # Scan ALL sections with raw data for vtables.
         # Xbox vtables can be in ANY section (including .text itself!)
         data_sections = [{"name": s["name"], "va": s["va"],
@@ -141,46 +145,25 @@ def scan_vtables(xbe_data, functions, imm_refs, verbose=False, sections=None):
 
 
 def _get_code_ranges():
-    """Get all code section VA ranges from config."""
-    ranges = [(config.TEXT_VA_START, config.TEXT_VA_END)]
-
-    # Add any other code sections defined in config
-    if hasattr(config, 'SECTIONS'):
-        skip_names = {".data", ".data1", "XIPS", "EnglishXlate", "JapaneseXlate",
-                      "GermanXlate", "FrenchXlate", "SpanishXlate", "ItalianXlate"}
-        for name, va, size, _ in config.SECTIONS:
-            if name not in skip_names and name != ".text":
-                ranges.append((va, va + size))
-
-    return ranges
+    """Get every code range approved by the active target profile."""
+    return [
+        (section.virtual_address, section.virtual_end)
+        for section in config.code_sections()
+    ]
 
 
 def _get_data_sections():
-    """Get all data sections to scan for vtables."""
-    sections = []
-
-    # Primary scan range: .rdata or .data
-    if hasattr(config, 'RDATA_RAW_ADDR'):
-        sections.append({
-            "name": "rdata",
-            "va": config.RDATA_VA_START,
-            "size": config.RDATA_VA_SIZE,
-            "raw": config.RDATA_RAW_ADDR,
-        })
-
-    # Also scan all data sections from SECTIONS list
-    if hasattr(config, 'SECTIONS'):
-        data_names = {".data", ".data1", "DOLBY"}
-        for name, va, size, raw in config.SECTIONS:
-            if name in data_names:
-                sections.append({
-                    "name": name,
-                    "va": va,
-                    "size": size,
-                    "raw": raw,
-                })
-
-    return sections
+    """Get every target data section eligible for vtable scanning."""
+    return [
+        {
+            "name": section.name,
+            "va": section.virtual_address,
+            "size": section.virtual_size,
+            "raw": section.raw_address,
+        }
+        for section in config.data_sections()
+        if section.raw_size > 0
+    ]
 
 
 def _is_code_address(va, text_ranges):

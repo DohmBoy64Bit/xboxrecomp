@@ -36,14 +36,14 @@ The `src/` directory contains 6 static libraries that provide the Xbox hardware 
 
 ## Libraries
 
-| Library | Dir | LOC | Origin | Description |
-|---------|-----|-----|--------|-------------|
-| **xbox_kernel** | `kernel/` | 7,935 | Custom | Xbox kernel → Win32 replacement (147 imports) |
-| **xbox_d3d8** | `d3d/` | 3,372 | Custom | D3D8 → D3D11 graphics compatibility layer |
-| **xbox_dsound** | `audio/` | 573 | Custom | DirectSound → software mixer |
-| **xbox_apu** | `apu/` | 3,918 | xemu | MCPX APU audio emulation (256 voices) |
-| **xbox_nv2a** | `nv2a/` | 3,761 | xemu | NV2A GPU register handlers + MMIO |
-| **xbox_input** | `input/` | 212 | Custom | Xbox gamepad → XInput mapping |
+| Library | Dir | Origin | Description |
+|---------|-----|--------|-------------|
+| **xbox_kernel** | `kernel/` | Custom | Exact-XBE memory layout, validated per-title kernel-thunk dispatch, files, threads, synchronization, crypto, HAL, and other implemented/partial exports |
+| **xbox_d3d8** | `d3d/` | Custom | Host-selected D3D8 compatibility backend (D3D11 on Windows, OpenGL source on POSIX) |
+| **xbox_dsound** | `audio/` | Custom | DirectSound compatibility objects and mixer-facing behavior; validate audible output separately |
+| **xbox_apu** | `apu/` | xemu + custom | MCPX APU state, voices, MMIO, and host audio backends |
+| **xbox_nv2a** | `nv2a/` | xemu + custom | NV2A register handlers, MMIO, push-buffer processing, and host translation |
+| **xbox_input** | `input/` | Custom | Xbox controller state mapped to the active host input backend |
 
 ## Building
 
@@ -53,7 +53,7 @@ cmake -S . -B build
 cmake --build build --config Release
 ```
 
-Output: 6 `.lib` files in `build/src/*/Release/`.
+Output names and locations depend on the generator and host. The umbrella `xboxrecomp` CMake target links the six runtime libraries.
 
 ## Linking to Your Game
 
@@ -88,34 +88,40 @@ These resolve Xbox virtual addresses to native function pointers. The recompiler
 
 ## Initialization Order
 
+The current `templates/new-game` build emits `target_profile.h` only after the
+profile, parser JSON, and exact XBE agree. Runtime initialization must then fail
+closed when target memory or thunk validation fails:
+
 ```c
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#include "target_profile.h"
 
-int main() {
-    // 1. Map Xbox 64MB address space (sections, stack, heap, mirrors)
-    xbox_MemoryLayoutInit(xbe_data, xbe_size);
+int main(void) {
+    if (!xbox_MemoryLayoutInit(xbe_data, xbe_size))
+        return 1;
 
-    // 2. Initialize kernel thunk table (147 imports → Win32)
+    g_xbox_mem_offset = xbox_GetMemoryOffset();
     xbox_kernel_init();
-    xbox_kernel_bridge_init();
+    xbox_path_init(game_dir, save_dir);
+    if (!xbox_kernel_bridge_init())
+        return 1;
 
-    // 3. Initialize graphics
-    IDirect3D8 *d3d = xbox_Direct3DCreate8(0);
-    // ... create device, window, etc.
+    g_esp = XBOX_STACK_TOP;
 
-    // 4. Initialize audio (optional)
-    MCPXAPUState *apu = mcpx_apu_init_standalone(ram_ptr);
-
-    // 5. Initialize GPU (optional)
-    NV2AState *gpu = nv2a_init_standalone(vram, vram_size, ramin, ramin_size);
-    nv2a_hook_init(g_xbox_mem_offset);
-
-    // 6. Jump to game entry point
-    void (*entry)(void) = recomp_lookup(ENTRY_POINT_VA);
+    /* Initialize only the graphics, audio, NV2A, and input surfaces used by
+       the selected title and host, then resolve the validated entry point. */
+    recomp_func_t entry = recomp_lookup(XBOX_TARGET_ENTRY_POINT);
+    if (!entry)
+        return 1;
     entry();
+    return 0;
 }
 ```
+
+The memory layer loads all target XBE sections and selects non-overlapping
+kernel-data, stack, and heap ranges dynamically. The bridge uses only the
+validated active thunk table for the current title.
 
 ## Per-Module Documentation
 
